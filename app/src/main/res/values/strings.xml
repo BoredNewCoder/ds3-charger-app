@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">DS3 Charger</string>
+    <string name="initial_status">Starting…</string>
+</resources>

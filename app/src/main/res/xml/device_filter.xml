@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sony DualShock 3: vendor 0x054C (1356), product 0x0268 (616).
+     device_filter.xml uses DECIMAL, not hex, for these attributes. -->
+<resources>
+    <usb-device vendor-id="1356" product-id="616" />
+</resources>
