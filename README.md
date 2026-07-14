@@ -9,10 +9,11 @@ Plug a genuine PS3 controller into anything that isn't a real PS3 (a PC, an Andr
 ## What this app does
 
 - Sends that operational-mode command automatically the moment a DS3 is plugged in (auto-launches via a USB device-attach intent filter — no need to open the app manually)
-- Reads and displays **live battery %** by polling the controller's own USB HID input report (every 5 min)
-- Lights one controller LED solid, once, when the battery reaches Full
+- Reads and displays **live battery %** by polling the controller's own USB HID input report (interval adjustable in Settings — 1/5/15/30 min, default 5)
+- Lights one controller LED solid, once, when the battery reaches Full (toggle on/off in Settings)
 - Runs as a foreground service with a persistent notification, so charging status keeps updating even after you leave the app
 - Handles more than one DS3 plugged in at once (e.g. via a USB hub)
+- Settings screen (TV-remote-friendly preset buttons, no on-screen keyboard needed) for both of the above — changes apply on the next poll, no restart needed
 
 ## How it works
 
