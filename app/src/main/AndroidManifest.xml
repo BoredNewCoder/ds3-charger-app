@@ -38,6 +38,11 @@
                 android:resource="@xml/device_filter" />
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Foreground service so USB polling + the persistent battery-%
              notification keep running even after the user leaves this
              app's screen - started from MainActivity.onCreate(), not

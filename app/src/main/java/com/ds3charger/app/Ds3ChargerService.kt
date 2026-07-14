@@ -50,7 +50,6 @@ class Ds3ChargerService : Service() {
     private val INPUT_REPORT_SIZE = 49
     private val BATTERY_BYTE_OFFSET = 30
     private val SIXAXIS_BATTERY_CAPACITY = intArrayOf(0, 1, 25, 50, 75, 100)
-    private val POLL_INTERVAL_MS = 5 * 60 * 1000L
 
     // LED output report, verified against hid-sony.c's sixaxis_send_output_
     // report()/struct sixaxis_output_report - same layout used before for
@@ -103,7 +102,11 @@ class Ds3ChargerService : Service() {
     private val pollRunnable = object : Runnable {
         override fun run() {
             devices.values.forEach { pollBattery(it) }
-            handler.postDelayed(this, POLL_INTERVAL_MS)
+            // Read fresh from Prefs every tick (not cached) so a change
+            // made in SettingsActivity takes effect on the very next poll,
+            // no service restart/rebind needed.
+            val intervalMs = Prefs.getPollIntervalMinutes(this@Ds3ChargerService) * 60 * 1000L
+            handler.postDelayed(this, intervalMs)
         }
     }
 
@@ -241,7 +244,7 @@ class Ds3ChargerService : Service() {
         // can't fight the game/OS's own LED state the way the earlier
         // (reverted) continuous chase did.
         if (status == "Full" && !state.fullLedSet) {
-            setLed(state, LED_FULL_CHARGE_BIT)
+            if (Prefs.isLedEnabled(this)) setLed(state, LED_FULL_CHARGE_BIT)
             state.fullLedSet = true
         } else if (status != "Full") {
             state.fullLedSet = false

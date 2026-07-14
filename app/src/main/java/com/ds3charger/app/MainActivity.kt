@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.widget.Button
 import android.widget.TextView
 
 /**
@@ -40,6 +41,9 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         statusView = findViewById(R.id.statusText)
+        findViewById<Button>(R.id.settingsButton).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
 
         requestNotificationPermissionIfNeeded()
 
