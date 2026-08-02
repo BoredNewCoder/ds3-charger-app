@@ -15,8 +15,8 @@ import android.hardware.usb.UsbManager
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
-import android.os.Looper
 import androidx.core.app.NotificationCompat
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -79,8 +79,27 @@ class Ds3ChargerService : Service() {
         var fullLedSet: Boolean = false,
     )
 
-    private val devices = mutableMapOf<Int, DeviceState>()  // key: UsbDevice.deviceId
-    private val handler = Handler(Looper.getMainLooper())
+    // synchronizedMap since bgHandler (poll/charge-command work) and the main
+    // thread (USB_DEVICE_DETACHED) both mutate this.
+    private val devices = java.util.Collections.synchronizedMap(mutableMapOf<Int, DeviceState>())
+
+    // All blocking USB control transfers (open/claim/controlTransfer/release)
+    // run here, never on the main thread - controlTransfer blocks for up to
+    // its timeout (2-5s), and with multiple DS3s on a hub the old code's
+    // main-thread Handler.forEach{ pollBattery } serialized N*2000ms+ of
+    // blocking calls right on the UI thread. Real jank/ANR risk on Shield.
+    private val bgThread = HandlerThread("Ds3ChargerPoll").apply { start() }
+    private val bgHandler = Handler(bgThread.looper)
+
+    private val MAX_CHARGE_COMMAND_ATTEMPTS = 3
+    private val CHARGE_COMMAND_RETRY_DELAY_MS = 500L
+
+    // While a device is actively "Charging" it's closing in on Full - poll
+    // fast so the one-shot full-charge LED/notification react quickly,
+    // regardless of the user's base interval setting. Once it hits Full or
+    // sits "On battery", drop back to the base interval - no urgency there.
+    private val FAST_POLL_INTERVAL_MS = 30_000L
+
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var listener: Listener? = null
 
@@ -101,12 +120,17 @@ class Ds3ChargerService : Service() {
 
     private val pollRunnable = object : Runnable {
         override fun run() {
-            devices.values.forEach { pollBattery(it) }
+            // Copy under lock, then poll outside it - pollBattery's blocking
+            // controlTransfer calls shouldn't hold the map lock the whole time.
+            val snapshot = synchronized(devices) { devices.values.toList() }
+            snapshot.forEach { pollBattery(it) }
             // Read fresh from Prefs every tick (not cached) so a change
             // made in SettingsActivity takes effect on the very next poll,
             // no service restart/rebind needed.
-            val intervalMs = Prefs.getPollIntervalMinutes(this@Ds3ChargerService) * 60 * 1000L
-            handler.postDelayed(this, intervalMs)
+            val baseIntervalMs = Prefs.getPollIntervalMinutes(this@Ds3ChargerService) * 60 * 1000L
+            val anyCharging = snapshot.any { it.lastStatus == "Charging" }
+            val intervalMs = if (anyCharging) minOf(FAST_POLL_INTERVAL_MS, baseIntervalMs) else baseIntervalMs
+            bgHandler.postDelayed(this, intervalMs)
         }
     }
 
@@ -165,7 +189,7 @@ class Ds3ChargerService : Service() {
             .filter { it.vendorId == SONY_VENDOR_ID && it.productId == DS3_PRODUCT_ID }
             .forEach { checkAndRequestDevice(it) }
 
-        handler.post(pollRunnable)
+        bgHandler.post(pollRunnable)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -186,9 +210,26 @@ class Ds3ChargerService : Service() {
     }
 
     private fun sendChargeCommand(device: UsbDevice) {
-        val connection: UsbDeviceConnection = usbManager.openDevice(device) ?: return
+        // Enqueue onto the dedicated USB thread - callers (usbReceiver,
+        // onCreate's initial scan) run on the main thread and must not block
+        // on the control transfer below.
+        bgHandler.post { sendChargeCommandAttempt(device, attempt = 1) }
+    }
+
+    private fun sendChargeCommandAttempt(device: UsbDevice, attempt: Int) {
+        if (devices.containsKey(device.deviceId)) return  // already tracked by an earlier attempt
+
+        val connection: UsbDeviceConnection? = usbManager.openDevice(device)
+        if (connection == null) {
+            retryChargeCommand(device, attempt, "openDevice failed")
+            return
+        }
         val intf = device.getInterface(0)
-        connection.claimInterface(intf, true)
+        if (!connection.claimInterface(intf, true)) {
+            connection.close()
+            retryChargeCommand(device, attempt, "claimInterface failed")
+            return
+        }
 
         // HID GET_REPORT, Feature report 0xF2, 17-byte buffer - matches
         // hid-sony.c's sixaxis_set_operational_usb() step 1 exactly (see
@@ -205,6 +246,7 @@ class Ds3ChargerService : Service() {
 
         if (result < 0) {
             connection.close()
+            retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
             return
         }
         val name = try {
@@ -214,6 +256,18 @@ class Ds3ChargerService : Service() {
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
         devices[device.deviceId] = DeviceState(connection, intf, infoLine)
         refreshUi()
+    }
+
+    // A transient claim/transfer failure (device still enumerating, briefly
+    // busy right after plug-in, etc) used to permanently drop the device
+    // until physical replug - USB_DEVICE_ATTACHED only fires once per plug
+    // event. Retry a few times with a short delay before giving up.
+    private fun retryChargeCommand(device: UsbDevice, attempt: Int, reason: String) {
+        if (attempt >= MAX_CHARGE_COMMAND_ATTEMPTS) return
+        bgHandler.postDelayed(
+            { sendChargeCommandAttempt(device, attempt + 1) },
+            CHARGE_COMMAND_RETRY_DELAY_MS
+        )
     }
 
     private fun pollBattery(state: DeviceState) {
@@ -264,11 +318,12 @@ class Ds3ChargerService : Service() {
     }
 
     private fun buildStatusText(): String {
-        if (devices.isEmpty()) {
+        val snapshot = synchronized(devices) { devices.values.toList() }
+        if (snapshot.isEmpty()) {
             return "No DualShock 3 connected.\nPlug it in (this app will auto-launch), or leave this open and plug it in now."
         }
         val time = timeFmt.format(java.util.Date())
-        return devices.values.joinToString("\n\n") { s ->
+        return snapshot.joinToString("\n\n") { s ->
             "${s.infoLine}\n[$time] Battery: ${s.lastBatteryPct}%  (${s.lastStatus})"
         }
     }
@@ -279,10 +334,11 @@ class Ds3ChargerService : Service() {
     }
 
     private fun updateNotification() {
-        val text = if (devices.isEmpty()) {
+        val snapshot = synchronized(devices) { devices.values.toList() }
+        val text = if (snapshot.isEmpty()) {
             "No controller connected"
         } else {
-            devices.values.joinToString("  |  ") { "${it.lastBatteryPct}% ${it.lastStatus}" }
+            snapshot.joinToString("  |  ") { "${it.lastBatteryPct}% ${it.lastStatus}" }
         }
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, buildNotification(text))
@@ -313,9 +369,12 @@ class Ds3ChargerService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        handler.removeCallbacksAndMessages(null)
-        devices.values.forEach { it.connection.close() }
-        devices.clear()
+        bgHandler.removeCallbacksAndMessages(null)
+        bgThread.quitSafely()
+        synchronized(devices) {
+            devices.values.forEach { it.connection.close() }
+            devices.clear()
+        }
         unregisterReceiver(usbReceiver)
     }
 
