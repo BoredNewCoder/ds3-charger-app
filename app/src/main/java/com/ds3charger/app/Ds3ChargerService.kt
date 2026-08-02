@@ -74,14 +74,48 @@ class Ds3ChargerService : Service() {
         var connection: UsbDeviceConnection,
         var intf: UsbInterface,
         var infoLine: String,
+        var deviceName: String,
+        var deviceId: Int,
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
         var fullLedSet: Boolean = false,
+        var consecutivePollFailures: Int = 0,
+    )
+
+    // A dead/gone connection just sits reporting "unavailable" forever
+    // otherwise, holding the interface claim and never getting evicted.
+    private val MAX_POLL_FAILURES = 3
+
+    // Clone DS3 pads (Shanwan/Gasia etc) report the SAME USB VID/PID as a
+    // genuine Sony controller (054c:0268) - the kernel's own hid-sony.c
+    // tells them apart only by USB iProduct string, not the IDs, so our
+    // vendorId/productId filter below already matches clones too. Verified
+    // against drivers/hid/hid-sony.c (torvalds/linux, checked 2026-08-02):
+    // sending SHANWAN_GAMEPAD units a normal output report during init
+    // makes them rumble non-stop, so the kernel explicitly skips that step
+    // for these exact matched names. Our one-shot full-charge LED write
+    // (setLed) is the same class of output report and has never been
+    // tested against real clone hardware - skip it defensively instead of
+    // risking the same symptom. (Names copied verbatim from the kernel
+    // match, including its "Ga`epad" backtick typo.)
+    private val SHANWAN_CLONE_NAMES = setOf(
+        "SHANWAN PS3 GamePad",
+        "ShanWan PS(R) Ga`epad",
     )
 
     // synchronizedMap since bgHandler (poll/charge-command work) and the main
     // thread (USB_DEVICE_DETACHED) both mutate this.
     private val devices = java.util.Collections.synchronizedMap(mutableMapOf<Int, DeviceState>())
+
+    // Reserved deviceIds that have a charge-command attempt in flight but
+    // haven't landed in `devices` yet (claiming the interface + the control
+    // transfer below can take up to ~5s). Without this, a second
+    // USB_DEVICE_ATTACHED for the same device - a replug bounce, or a hub
+    // renumbering during that window - would pass checkAndRequestDevice's
+    // "already tracked" check twice and kick off a duplicate permission
+    // request + claimInterface race on the same physical device. Always
+    // mutate this together with `devices` under the same `devices` lock.
+    private val pendingDeviceIds = mutableSetOf<Int>()
 
     // All blocking USB control transfers (open/claim/controlTransfer/release)
     // run here, never on the main thread - controlTransfer blocks for up to
@@ -91,8 +125,8 @@ class Ds3ChargerService : Service() {
     private val bgThread = HandlerThread("Ds3ChargerPoll").apply { start() }
     private val bgHandler = Handler(bgThread.looper)
 
-    private val MAX_CHARGE_COMMAND_ATTEMPTS = 3
-    private val CHARGE_COMMAND_RETRY_DELAY_MS = 500L
+    private val MAX_CHARGE_COMMAND_ATTEMPTS = 5
+    private val CHARGE_COMMAND_RETRY_BASE_DELAY_MS = 500L
 
     // While a device is actively "Charging" it's closing in on Full - poll
     // fast so the one-shot full-charge LED/notification react quickly,
@@ -143,6 +177,11 @@ class Ds3ChargerService : Service() {
                         val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                         if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                             device?.let { sendChargeCommand(it) }
+                        } else {
+                            // Denied - release the reservation checkAndRequestDevice
+                            // took, otherwise this deviceId is stuck "pending"
+                            // forever with no attempt ever landing in `devices`.
+                            device?.let { synchronized(devices) { pendingDeviceIds.remove(it.deviceId) } }
                         }
                     }
                 }
@@ -155,7 +194,10 @@ class Ds3ChargerService : Service() {
                     @Suppress("DEPRECATION")
                     val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     device?.let {
-                        devices.remove(it.deviceId)?.connection?.close()
+                        synchronized(devices) {
+                            devices.remove(it.deviceId)?.connection?.close()
+                            pendingDeviceIds.remove(it.deviceId)
+                        }
                         refreshUi()
                     }
                 }
@@ -196,7 +238,14 @@ class Ds3ChargerService : Service() {
 
     private fun checkAndRequestDevice(device: UsbDevice) {
         if (device.vendorId != SONY_VENDOR_ID || device.productId != DS3_PRODUCT_ID) return
-        if (devices.containsKey(device.deviceId)) return  // already tracked
+        // Atomically check-and-reserve: closes the TOCTOU window where a
+        // second ATTACHED broadcast for the same device lands before the
+        // first attempt's claimInterface/controlTransfer (up to ~5s) has
+        // added it to `devices`.
+        synchronized(devices) {
+            if (devices.containsKey(device.deviceId)) return  // already tracked
+            if (!pendingDeviceIds.add(device.deviceId)) return  // already pending
+        }
         if (usbManager.hasPermission(device)) {
             sendChargeCommand(device)
         } else {
@@ -249,12 +298,16 @@ class Ds3ChargerService : Service() {
             retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
             return
         }
+        val rawProductName = device.productName ?: ""
         val name = try {
             "${device.manufacturerName ?: "Sony"} ${device.productName ?: "PLAYSTATION(R)3 Controller"}"
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
         val infoLine = "Device: $name\nVID=0x${device.vendorId.toString(16)} " +
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
-        devices[device.deviceId] = DeviceState(connection, intf, infoLine)
+        synchronized(devices) {
+            devices[device.deviceId] = DeviceState(connection, intf, infoLine, rawProductName, device.deviceId)
+            pendingDeviceIds.remove(device.deviceId)
+        }
         refreshUi()
     }
 
@@ -263,10 +316,15 @@ class Ds3ChargerService : Service() {
     // until physical replug - USB_DEVICE_ATTACHED only fires once per plug
     // event. Retry a few times with a short delay before giving up.
     private fun retryChargeCommand(device: UsbDevice, attempt: Int, reason: String) {
-        if (attempt >= MAX_CHARGE_COMMAND_ATTEMPTS) return
+        if (attempt >= MAX_CHARGE_COMMAND_ATTEMPTS) {
+            synchronized(devices) { pendingDeviceIds.remove(device.deviceId) }
+            return
+        }
+        // Linear backoff (500ms, 1000ms, 1500ms...) - some hubs are slower
+        // to finish enumerating than a flat delay accounts for.
         bgHandler.postDelayed(
             { sendChargeCommandAttempt(device, attempt + 1) },
-            CHARGE_COMMAND_RETRY_DELAY_MS
+            CHARGE_COMMAND_RETRY_BASE_DELAY_MS * attempt
         )
     }
 
@@ -281,10 +339,24 @@ class Ds3ChargerService : Service() {
         state.connection.releaseInterface(state.intf)
 
         if (result <= BATTERY_BYTE_OFFSET) {
+            state.consecutivePollFailures++
+            if (state.consecutivePollFailures >= MAX_POLL_FAILURES) {
+                // Connection's dead (device gone but DETACHED hasn't/won't
+                // fire, e.g. a hub power fault) - stop holding the claim on
+                // it forever, let a future re-plug get a clean attempt.
+                synchronized(devices) {
+                    devices.remove(state.deviceId)
+                    pendingDeviceIds.remove(state.deviceId)
+                }
+                state.connection.close()
+                refreshUi()
+                return
+            }
             state.lastStatus = "Battery: unavailable (short report)"
             refreshUi()
             return
         }
+        state.consecutivePollFailures = 0
         val raw = buf[BATTERY_BYTE_OFFSET].toInt() and 0xFF
         val (pct, status) = when {
             raw >= 0xee -> 100 to (if (raw and 0x01 == 1) "Full" else "Charging")
@@ -298,7 +370,9 @@ class Ds3ChargerService : Service() {
         // can't fight the game/OS's own LED state the way the earlier
         // (reverted) continuous chase did.
         if (status == "Full" && !state.fullLedSet) {
-            if (Prefs.isLedEnabled(this)) setLed(state, LED_FULL_CHARGE_BIT)
+            if (Prefs.isLedEnabled(this) && state.deviceName !in SHANWAN_CLONE_NAMES) {
+                setLed(state, LED_FULL_CHARGE_BIT)
+            }
             state.fullLedSet = true
         } else if (status != "Full") {
             state.fullLedSet = false
@@ -352,7 +426,7 @@ class Ds3ChargerService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("DS3 Charger")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_manage)
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .setContentIntent(pending)
             .build()
@@ -375,7 +449,12 @@ class Ds3ChargerService : Service() {
             devices.values.forEach { it.connection.close() }
             devices.clear()
         }
-        unregisterReceiver(usbReceiver)
+        try {
+            unregisterReceiver(usbReceiver)
+        } catch (e: IllegalArgumentException) {
+            // Never registered (service killed mid-onCreate before the
+            // registerReceiver call) - nothing to unregister.
+        }
     }
 
     companion object {
