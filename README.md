@@ -32,7 +32,7 @@ The all-4-LEDs blink you see when powering the controller on over **Bluetooth** 
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
-- A genuine Sony DualShock 3 (clone/third-party controllers may need extra steps not implemented here — see `hid-sony.c`'s handling of Shanwan/Gasia/Speedlink Strike FX clones)
+- A genuine Sony DualShock 3, or a Shanwan/Gasia clone — clones report the exact same USB vendor/product ID (`054c:0268`) as a real DS3, so they're detected and charged the same way. One difference: the full-charge LED indicator is skipped for detected Shanwan/Gasia clones, since the Linux kernel's own driver (`hid-sony.c`) notes these units can rumble non-stop if sent an output report during init, and that hasn't been tested against real clone hardware here
 - Android 5.0 (API 21) or newer
 
 ## Install
