@@ -40,19 +40,6 @@ class Ds3ChargerService : Service() {
     private val SONY_VENDOR_ID = 0x054C
     private val DS3_PRODUCT_ID = 0x0268
 
-    // This host's own Bluetooth adapter address, written into each DS3 as its
-    // BT pairing target - see writeBtPairingAddress(). Regular apps can't
-    // read their own device's real BT MAC at runtime (Android hides it
-    // behind LOCAL_MAC_ADDRESS, a signature|privileged permission, since API
-    // 23), so it comes from BuildConfig instead, sourced from local.properties
-    // (gitignored - not committed, never pushed) rather than hardcoded in
-    // source. Empty/blank if local.properties has no shield.bt.mac entry.
-    private val SHIELD_BT_MAC: ByteArray? = BuildConfig.SHIELD_BT_MAC
-        .takeIf { it.length == 12 }
-        ?.chunked(2)
-        ?.map { it.toInt(16).toByte() }
-        ?.toByteArray()
-
     // Battery reporting, verified against the real Linux kernel source
     // (drivers/hid/hid-sony.c, sixaxis_parse_report()): byte 30 of the
     // standard 49-byte USB input report (HID report ID 0x01) carries
@@ -68,7 +55,6 @@ class Ds3ChargerService : Service() {
         var connection: UsbDeviceConnection,
         var intf: UsbInterface,
         var infoLine: String,
-        var deviceName: String,
         var deviceId: Int,
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
@@ -78,22 +64,6 @@ class Ds3ChargerService : Service() {
     // A dead/gone connection just sits reporting "unavailable" forever
     // otherwise, holding the interface claim and never getting evicted.
     private val MAX_POLL_FAILURES = 3
-
-    // Clone DS3 pads (Shanwan/Gasia etc) report the SAME USB VID/PID as a
-    // genuine Sony controller (054c:0268) - the kernel's own hid-sony.c
-    // tells them apart only by USB iProduct string, not the IDs, so our
-    // vendorId/productId filter below already matches clones too. Verified
-    // against drivers/hid/hid-sony.c (torvalds/linux, checked 2026-08-02):
-    // sending SHANWAN_GAMEPAD units a normal output report during init
-    // makes them rumble non-stop, so the kernel explicitly skips that step
-    // for these exact matched names. writeBtPairingAddress()'s feature-report
-    // write has never been tested against real clone hardware - skip it
-    // defensively instead of risking the same symptom. (Names copied
-    // verbatim from the kernel match, including its "Ga`epad" backtick typo.)
-    private val SHANWAN_CLONE_NAMES = setOf(
-        "SHANWAN PS3 GamePad",
-        "ShanWan PS(R) Ga`epad",
-    )
 
     // synchronizedMap since bgHandler (poll/charge-command work) and the main
     // thread (USB_DEVICE_DETACHED) both mutate this.
@@ -284,27 +254,6 @@ class Ds3ChargerService : Service() {
         val buf = ByteArray(17)
         val result = connection.controlTransfer(0xA1, 0x01, 0x03F2, intf.id, buf, buf.size, 5000)
 
-        // Write this Shield's own Bluetooth MAC into the pad as its pairing
-        // "master" address, same session, same interface claim - without
-        // this the pad has no target to connect to over BT and just sits
-        // blinking all 4 LEDs looking for one. Not something Android's own
-        // Bluetooth Settings pairing screen can do for a DS3 (it doesn't use
-        // standard discovery/PIN pairing) - only a USB HID feature-report
-        // write does it, which is exactly what this service already has an
-        // open, claimed connection for.
-        //
-        // Byte layout (report 0xF5, 8 bytes: 0x01, 0x00, 6 raw MAC bytes) is
-        // the same one every long-established Linux Sixaxis pairing tool
-        // uses (sixpair, sixad, ds4drv, QtSixA, PCSX2's pad tool) - common,
-        // well-established reverse-engineering, NOT freshly re-verified
-        // against hid-sony.c itself the way the 0xF2/LED reports were,
-        // because the kernel driver only ever receives BT connections here
-        // - it has no writer-side function to check against. If pairing
-        // doesn't take, this byte layout is the first thing to question.
-        if ((device.productName ?: "") !in SHANWAN_CLONE_NAMES && SHIELD_BT_MAC != null) {
-            writeBtPairingAddress(connection, intf, SHIELD_BT_MAC)
-        }
-
         // Release right away - holding it exclusively blocks any other
         // consumer (the game, the OS's own USB-HID path) for as long as
         // this service runs. Real regression found 2026-07-13 from an
@@ -316,14 +265,13 @@ class Ds3ChargerService : Service() {
             retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
             return
         }
-        val rawProductName = device.productName ?: ""
         val name = try {
             "${device.manufacturerName ?: "Sony"} ${device.productName ?: "PLAYSTATION(R)3 Controller"}"
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
         val infoLine = "Device: $name\nVID=0x${device.vendorId.toString(16)} " +
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
         synchronized(devices) {
-            devices[device.deviceId] = DeviceState(connection, intf, infoLine, rawProductName, device.deviceId)
+            devices[device.deviceId] = DeviceState(connection, intf, infoLine, device.deviceId)
             pendingDeviceIds.remove(device.deviceId)
         }
         refreshUi()
@@ -380,15 +328,6 @@ class Ds3ChargerService : Service() {
         }
         state.lastBatteryPct = pct
         state.lastStatus = status
-    }
-
-    // See the call site in sendChargeCommandAttempt() for why this exists.
-    // bmRequestType 0x21 = Class | Interface | Host-to-Device
-    // bRequest      0x09 = SET_REPORT
-    // wValue      0x03F5 = ReportType Feature(3) << 8 | ReportID 0xF5
-    private fun writeBtPairingAddress(connection: UsbDeviceConnection, intf: UsbInterface, mac: ByteArray) {
-        val buf = byteArrayOf(0x01, 0x00) + mac
-        connection.controlTransfer(0x21, 0x09, 0x03F5, intf.id, buf, buf.size, 1000)
     }
 
     private fun buildStatusText(): String {
