@@ -136,6 +136,7 @@ class Ds3ChargerService : Service() {
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var listener: Listener? = null
+    private var lastNotifiedText: String? = null
 
     interface Listener {
         fun onStatusUpdate(text: String)
@@ -158,6 +159,10 @@ class Ds3ChargerService : Service() {
             // controlTransfer calls shouldn't hold the map lock the whole time.
             val snapshot = synchronized(devices) { devices.values.toList() }
             snapshot.forEach { pollBattery(it) }
+            // Single refresh after the whole batch - pollBattery used to call
+            // this per-device, so N controllers meant N notify()/listener
+            // calls per tick instead of 1.
+            refreshUi()
             // Read fresh from Prefs every tick (not cached) so a change
             // made in SettingsActivity takes effect on the very next poll,
             // no service restart/rebind needed.
@@ -349,11 +354,9 @@ class Ds3ChargerService : Service() {
                     pendingDeviceIds.remove(state.deviceId)
                 }
                 state.connection.close()
-                refreshUi()
                 return
             }
             state.lastStatus = "Battery: unavailable (short report)"
-            refreshUi()
             return
         }
         state.consecutivePollFailures = 0
@@ -377,7 +380,6 @@ class Ds3ChargerService : Service() {
         } else if (status != "Full") {
             state.fullLedSet = false
         }
-        refreshUi()
     }
 
     private fun setLed(state: DeviceState, bitmap: Int) {
@@ -414,6 +416,10 @@ class Ds3ChargerService : Service() {
         } else {
             snapshot.joinToString("  |  ") { "${it.lastBatteryPct}% ${it.lastStatus}" }
         }
+        // Skip the notify() call entirely when nothing changed since last
+        // tick - every poll used to rewrite the notification unconditionally.
+        if (text == lastNotifiedText) return
+        lastNotifiedText = text
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, buildNotification(text))
     }
