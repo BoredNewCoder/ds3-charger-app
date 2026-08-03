@@ -68,7 +68,10 @@ class Ds3ChargerService : Service() {
         0x00, 0x00, 0x00, 0x00, 0x00
     ).map { it.toByte() }.toByteArray()
     private val LED_BITMAP_OFFSET = 10
-    private val LED_FULL_CHARGE_BIT = 0x10  // LED4, arbitrary but distinct from typical player-1/2/3 slots
+    // Verified against hid-sony.c's leds_bitmap comment: LED_1=0x02, LED_2=0x04,
+    // LED_3=0x08, LED_4=0x10 - OR all four so every LED lights on full charge,
+    // not just one.
+    private val LED_ALL_ON_BITMAP = 0x02 or 0x04 or 0x08 or 0x10
 
     private class DeviceState(
         var connection: UsbDeviceConnection,
@@ -374,7 +377,7 @@ class Ds3ChargerService : Service() {
         // (reverted) continuous chase did.
         if (status == "Full" && !state.fullLedSet) {
             if (Prefs.isLedEnabled(this) && state.deviceName !in SHANWAN_CLONE_NAMES) {
-                setLed(state, LED_FULL_CHARGE_BIT)
+                setLed(state, LED_ALL_ON_BITMAP)
             }
             state.fullLedSet = true
         } else if (status != "Full") {
