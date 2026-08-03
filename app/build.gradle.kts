@@ -13,6 +13,13 @@ val keystoreProps = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
+// This host's own BT MAC (see writeBtPairingAddress in Ds3ChargerService)
+// lives in local.properties, not source - gitignored, never pushed.
+val localProps = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+
 android {
     namespace = "com.ds3charger.app"
     compileSdk = 34
@@ -23,6 +30,14 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        buildConfigField(
+            "String", "SHIELD_BT_MAC",
+            "\"${localProps.getProperty("shield.bt.mac", "")}\""
+        )
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     signingConfigs {

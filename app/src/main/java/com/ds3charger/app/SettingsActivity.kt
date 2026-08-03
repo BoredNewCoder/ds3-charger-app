@@ -16,23 +16,17 @@ import android.widget.TextView
 class SettingsActivity : Activity() {
 
     private lateinit var intervalStatus: TextView
-    private lateinit var ledToggle: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
 
         intervalStatus = findViewById(R.id.intervalStatus)
-        ledToggle = findViewById(R.id.ledToggle)
 
         findViewById<Button>(R.id.interval1).setOnClickListener { setInterval(1) }
         findViewById<Button>(R.id.interval5).setOnClickListener { setInterval(5) }
         findViewById<Button>(R.id.interval15).setOnClickListener { setInterval(15) }
         findViewById<Button>(R.id.interval30).setOnClickListener { setInterval(30) }
-        ledToggle.setOnClickListener {
-            Prefs.setLedEnabled(this, !Prefs.isLedEnabled(this))
-            refreshUi()
-        }
         findViewById<Button>(R.id.backButton).setOnClickListener { finish() }
 
         refreshUi()
@@ -45,6 +39,5 @@ class SettingsActivity : Activity() {
 
     private fun refreshUi() {
         intervalStatus.text = "Currently: every ${Prefs.getPollIntervalMinutes(this)} min"
-        ledToggle.text = if (Prefs.isLedEnabled(this)) "ON (tap to disable)" else "OFF (tap to enable)"
     }
 }

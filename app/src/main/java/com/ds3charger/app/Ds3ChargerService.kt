@@ -40,6 +40,19 @@ class Ds3ChargerService : Service() {
     private val SONY_VENDOR_ID = 0x054C
     private val DS3_PRODUCT_ID = 0x0268
 
+    // This host's own Bluetooth adapter address, written into each DS3 as its
+    // BT pairing target - see writeBtPairingAddress(). Regular apps can't
+    // read their own device's real BT MAC at runtime (Android hides it
+    // behind LOCAL_MAC_ADDRESS, a signature|privileged permission, since API
+    // 23), so it comes from BuildConfig instead, sourced from local.properties
+    // (gitignored - not committed, never pushed) rather than hardcoded in
+    // source. Empty/blank if local.properties has no shield.bt.mac entry.
+    private val SHIELD_BT_MAC: ByteArray? = BuildConfig.SHIELD_BT_MAC
+        .takeIf { it.length == 12 }
+        ?.chunked(2)
+        ?.map { it.toInt(16).toByte() }
+        ?.toByteArray()
+
     // Battery reporting, verified against the real Linux kernel source
     // (drivers/hid/hid-sony.c, sixaxis_parse_report()): byte 30 of the
     // standard 49-byte USB input report (HID report ID 0x01) carries
@@ -51,28 +64,6 @@ class Ds3ChargerService : Service() {
     private val BATTERY_BYTE_OFFSET = 30
     private val SIXAXIS_BATTERY_CAPACITY = intArrayOf(0, 1, 25, 50, 75, 100)
 
-    // LED output report, verified against hid-sony.c's sixaxis_send_output_
-    // report()/struct sixaxis_output_report - same layout used before for
-    // the (reverted) LED chase, kept here for a single ONE-SHOT "fully
-    // charged" indicator instead: set once when a device transitions to
-    // Full, not a repeating animation, so it doesn't fight the game/OS's
-    // own LED state the way a continuous cycle would.
-    private val LED_DEFAULT_REPORT = intArrayOf(
-        0x01,
-        0x01, 0xff, 0x00, 0xff, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00,
-        0xff, 0x27, 0x10, 0x00, 0x32,
-        0xff, 0x27, 0x10, 0x00, 0x32,
-        0xff, 0x27, 0x10, 0x00, 0x32,
-        0xff, 0x27, 0x10, 0x00, 0x32,
-        0x00, 0x00, 0x00, 0x00, 0x00
-    ).map { it.toByte() }.toByteArray()
-    private val LED_BITMAP_OFFSET = 10
-    // Verified against hid-sony.c's leds_bitmap comment: LED_1=0x02, LED_2=0x04,
-    // LED_3=0x08, LED_4=0x10 - OR all four so every LED lights on full charge,
-    // not just one.
-    private val LED_ALL_ON_BITMAP = 0x02 or 0x04 or 0x08 or 0x10
-
     private class DeviceState(
         var connection: UsbDeviceConnection,
         var intf: UsbInterface,
@@ -81,7 +72,6 @@ class Ds3ChargerService : Service() {
         var deviceId: Int,
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
-        var fullLedSet: Boolean = false,
         var consecutivePollFailures: Int = 0,
     )
 
@@ -96,11 +86,10 @@ class Ds3ChargerService : Service() {
     // against drivers/hid/hid-sony.c (torvalds/linux, checked 2026-08-02):
     // sending SHANWAN_GAMEPAD units a normal output report during init
     // makes them rumble non-stop, so the kernel explicitly skips that step
-    // for these exact matched names. Our one-shot full-charge LED write
-    // (setLed) is the same class of output report and has never been
-    // tested against real clone hardware - skip it defensively instead of
-    // risking the same symptom. (Names copied verbatim from the kernel
-    // match, including its "Ga`epad" backtick typo.)
+    // for these exact matched names. writeBtPairingAddress()'s feature-report
+    // write has never been tested against real clone hardware - skip it
+    // defensively instead of risking the same symptom. (Names copied
+    // verbatim from the kernel match, including its "Ga`epad" backtick typo.)
     private val SHANWAN_CLONE_NAMES = setOf(
         "SHANWAN PS3 GamePad",
         "ShanWan PS(R) Ga`epad",
@@ -132,9 +121,9 @@ class Ds3ChargerService : Service() {
     private val CHARGE_COMMAND_RETRY_BASE_DELAY_MS = 500L
 
     // While a device is actively "Charging" it's closing in on Full - poll
-    // fast so the one-shot full-charge LED/notification react quickly,
-    // regardless of the user's base interval setting. Once it hits Full or
-    // sits "On battery", drop back to the base interval - no urgency there.
+    // fast so the notification reacts quickly, regardless of the user's base
+    // interval setting. Once it hits Full or sits "On battery", drop back to
+    // the base interval - no urgency there.
     private val FAST_POLL_INTERVAL_MS = 30_000L
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -295,6 +284,27 @@ class Ds3ChargerService : Service() {
         val buf = ByteArray(17)
         val result = connection.controlTransfer(0xA1, 0x01, 0x03F2, intf.id, buf, buf.size, 5000)
 
+        // Write this Shield's own Bluetooth MAC into the pad as its pairing
+        // "master" address, same session, same interface claim - without
+        // this the pad has no target to connect to over BT and just sits
+        // blinking all 4 LEDs looking for one. Not something Android's own
+        // Bluetooth Settings pairing screen can do for a DS3 (it doesn't use
+        // standard discovery/PIN pairing) - only a USB HID feature-report
+        // write does it, which is exactly what this service already has an
+        // open, claimed connection for.
+        //
+        // Byte layout (report 0xF5, 8 bytes: 0x01, 0x00, 6 raw MAC bytes) is
+        // the same one every long-established Linux Sixaxis pairing tool
+        // uses (sixpair, sixad, ds4drv, QtSixA, PCSX2's pad tool) - common,
+        // well-established reverse-engineering, NOT freshly re-verified
+        // against hid-sony.c itself the way the 0xF2/LED reports were,
+        // because the kernel driver only ever receives BT connections here
+        // - it has no writer-side function to check against. If pairing
+        // doesn't take, this byte layout is the first thing to question.
+        if ((device.productName ?: "") !in SHANWAN_CLONE_NAMES && SHIELD_BT_MAC != null) {
+            writeBtPairingAddress(connection, intf, SHIELD_BT_MAC)
+        }
+
         // Release right away - holding it exclusively blocks any other
         // consumer (the game, the OS's own USB-HID path) for as long as
         // this service runs. Real regression found 2026-07-13 from an
@@ -370,30 +380,15 @@ class Ds3ChargerService : Service() {
         }
         state.lastBatteryPct = pct
         state.lastStatus = status
-
-        // One-shot "fully charged" LED - set ONCE on the Charging->Full
-        // transition, not repeated every poll and not an animation, so it
-        // can't fight the game/OS's own LED state the way the earlier
-        // (reverted) continuous chase did.
-        if (status == "Full" && !state.fullLedSet) {
-            if (Prefs.isLedEnabled(this) && state.deviceName !in SHANWAN_CLONE_NAMES) {
-                setLed(state, LED_ALL_ON_BITMAP)
-            }
-            state.fullLedSet = true
-        } else if (status != "Full") {
-            state.fullLedSet = false
-        }
     }
 
-    private fun setLed(state: DeviceState, bitmap: Int) {
-        val buf = LED_DEFAULT_REPORT.copyOf()
-        buf[LED_BITMAP_OFFSET] = bitmap.toByte()
-        state.connection.claimInterface(state.intf, true)
-        // bmRequestType 0x21 = Class | Interface | Host-to-Device
-        // bRequest      0x09 = SET_REPORT
-        // wValue      0x0201 = ReportType Output(2) << 8 | ReportID 0x01
-        state.connection.controlTransfer(0x21, 0x09, 0x0201, state.intf.id, buf, buf.size, 1000)
-        state.connection.releaseInterface(state.intf)
+    // See the call site in sendChargeCommandAttempt() for why this exists.
+    // bmRequestType 0x21 = Class | Interface | Host-to-Device
+    // bRequest      0x09 = SET_REPORT
+    // wValue      0x03F5 = ReportType Feature(3) << 8 | ReportID 0xF5
+    private fun writeBtPairingAddress(connection: UsbDeviceConnection, intf: UsbInterface, mac: ByteArray) {
+        val buf = byteArrayOf(0x01, 0x00) + mac
+        connection.controlTransfer(0x21, 0x09, 0x03F5, intf.id, buf, buf.size, 1000)
     }
 
     private fun buildStatusText(): String {
