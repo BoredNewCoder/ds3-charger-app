@@ -10,10 +10,9 @@ Plug a genuine PS3 controller into anything that isn't a real PS3 (a PC, an Andr
 
 - Sends that operational-mode command automatically the moment a DS3 is plugged in (auto-launches via a USB device-attach intent filter — no need to open the app manually)
 - Reads and displays **live battery %** by polling the controller's own USB HID input report (interval adjustable in Settings — 1/5/15/30 min, default 5)
-- Lights one controller LED solid, once, when the battery reaches Full (toggle on/off in Settings)
 - Runs as a foreground service with a persistent notification, so charging status keeps updating even after you leave the app
 - Handles more than one DS3 plugged in at once (e.g. via a USB hub)
-- Settings screen (TV-remote-friendly preset buttons, no on-screen keyboard needed) for both of the above — changes apply on the next poll, no restart needed
+- Settings screen (TV-remote-friendly preset buttons, no on-screen keyboard needed) for the poll interval — changes apply on the next poll, no restart needed
 
 ## How it works
 
@@ -21,18 +20,18 @@ Everything here is a raw USB HID control transfer via Android's `UsbManager`/`Us
 
 - **Enter operational mode / start charging**: `sixaxis_set_operational_usb()` — a single `HID GET_REPORT` on Feature report `0xF2` (17 bytes)
 - **Battery level**: `sixaxis_parse_report()` — byte 30 of the standard 49-byte input report. `0xee`/`0xef` = charging/full; otherwise a 0–5 index into `{0, 1, 25, 50, 75, 100}` (not a raw percentage)
-- **LED control**: `sixaxis_send_output_report()` / `struct sixaxis_output_report` — a 36-byte output report, byte 10 is the LED bitmap (`LED1=0x02, LED2=0x04, LED3=0x08, LED4=0x10`)
 
 The USB interface is claimed only for the duration of each individual transfer, not held continuously — holding it exclusively was tried early on and broke the controller's normal use as a Bluetooth gamepad while it was plugged in charging.
 
 ## What this app deliberately does NOT do
 
-The all-4-LEDs blink you see when powering the controller on over **Bluetooth** (searching for/reconnecting to its last-paired host) can't be touched by this app, or by any app, without root — it happens before any HID connection exists, and the Android component that could intervene after connecting (`HidHostService`) is a system-only service gated behind privileged permissions no sideloaded app can hold.
+- **A full-charge LED indicator was tried and removed.** Lighting all 4 LEDs when the battery hits Full worked at the USB protocol level (confirmed via a real interrupt-endpoint output-report write), but Android itself assigns a connected DS3 a real gamepad "player slot" (`ControllerNumber` in `dumpsys input`) and continuously re-asserts its own single player-indicator LED on the same report — even a few-times-a-second re-write from this app couldn't hold a steady all-4 state against it. Those 4 LEDs are effectively OS-owned once Android recognizes the pad as a gamepad; the notification's `100% Full` text is the actual full-charge indicator now.
+- **Bluetooth pairing needs no help from this app.** A DS3 doesn't use standard discovery/PIN Bluetooth pairing — it connects to whatever host MAC address is stored in it, normally written via a USB HID feature report (`0xF5`) while plugged in. Android's own `hid-sony` kernel driver already does this automatically on USB plug-in; a from-scratch reimplementation of that write was tested here and confirmed working (the pad paired and reconnected over BT on a PS-button press), then removed as redundant once it was clear Android already handled it without this app's involvement.
 
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
-- A genuine Sony DualShock 3, or a Shanwan/Gasia clone — clones report the exact same USB vendor/product ID (`054c:0268`) as a real DS3, so they're detected and charged the same way. One difference: the full-charge LED indicator is skipped for detected Shanwan/Gasia clones, since the Linux kernel's own driver (`hid-sony.c`) notes these units can rumble non-stop if sent an output report during init, and that hasn't been tested against real clone hardware here
+- A genuine Sony DualShock 3, or a Shanwan/Gasia clone — clones report the exact same USB vendor/product ID (`054c:0268`) as a real DS3, so they're detected and charged the same way
 - Android 5.0 (API 21) or newer
 
 ## Install
@@ -53,6 +52,8 @@ cd ds3-charger-app
 ```
 
 Or open in Android Studio and hit Run.
+
+`assembleRelease` is minified/shrunk (R8) and needs a signing keystore referenced from a local, gitignored `keystore.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`) — without one it builds an unsigned APK that `adb install` will reject.
 
 ## License
 
