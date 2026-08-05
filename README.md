@@ -58,3 +58,10 @@ Or open in Android Studio and hit Run.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Support
+
+If this saved you time or you just want to say thanks:
+
+**Cash App:** [$CVanZetta](https://cash.app/$CVanZetta)
