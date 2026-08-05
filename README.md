@@ -11,8 +11,9 @@ Plug a genuine PS3 controller into anything that isn't a real PS3 (a PC, an Andr
 - Sends that operational-mode command automatically the moment a DS3 is plugged in (auto-launches via a USB device-attach intent filter — no need to open the app manually)
 - Reads and displays **live battery %** by polling the controller's own USB HID input report (interval adjustable in Settings — 1/5/15/30 min, default 5)
 - Runs as a foreground service with a persistent notification, so charging status keeps updating even after you leave the app
-- Handles more than one DS3 plugged in at once (e.g. via a USB hub)
-- Settings screen (TV-remote-friendly preset buttons, no on-screen keyboard needed) for the poll interval — changes apply on the next poll, no restart needed
+- **Charge-complete alert**: pops a separate, actually-alerting notification (not just a silent status update) the moment a controller finishes charging — toggle in Settings, on by default. This is the one real "next charging level" event the DS3 hardware exposes; it only reports live battery % while *not* charging (see [How it works](#how-it-works)), so there's no granular 25/50/75% alert while plugged in, just the Charging → Full transition
+- Handles more than one DS3 plugged in at once (e.g. via a USB hub) — the charge-complete alert fires independently per controller
+- Settings screen (TV-remote-friendly preset buttons, no on-screen keyboard needed) for the poll interval and the charge-complete alert toggle — changes apply on the next poll, no restart needed
 
 ## How it works
 
@@ -27,6 +28,10 @@ The USB interface is claimed only for the duration of each individual transfer, 
 
 - **A full-charge LED indicator was tried and removed.** Lighting all 4 LEDs when the battery hits Full worked at the USB protocol level (confirmed via a real interrupt-endpoint output-report write), but Android itself assigns a connected DS3 a real gamepad "player slot" (`ControllerNumber` in `dumpsys input`) and re-asserts its own single player-indicator LED on the same report — even a few-times-a-second re-write from this app couldn't hold a steady all-4 state against it. The notification's `100% Full` text is the actual full-charge indicator now.
 - **The all-4-LEDs blink over Bluetooth can't be fixed by this app.** A DS3's own pairing-address write (the USB HID feature report `0xF5`) was tested here and confirmed working - Android's `hid-sony` kernel driver already does that automatically on USB plug-in, so this app doesn't need to touch it. But the LED *itself* stays blinking even once fully connected and assigned a player slot (confirmed live, 2026-08-03) - a real PS3 console holds that LED steady by continuously asserting it throughout a game session; Android's stock input framework doesn't do that babysitting for a generic Bluetooth gamepad, and there's no unprivileged Bluetooth-HID-output API a sideloaded app can use to fake it (unlike the USB side, which has `UsbManager`, there's no equivalent raw access without root or the system-only `HidHostService`/`BLUETOOTH_PRIVILEGED`). This is a genuine platform limitation, not something left undone.
+
+## A note on the charge-complete alert not showing up
+
+Whether the charge-complete alert actually pops on screen depends on your Android TV **launcher**, not this app — unlike phones, Android TV doesn't render heads-up notification banners at the system level, that's up to whichever launcher app is set as default. Stock FLauncher, for example, doesn't implement notification overlays at all (the notification is still posted correctly, it just never displays). If yours doesn't show it, either check your launcher for a "notification overlay" style setting, or switch to one that has it (e.g. [LTvLauncher](https://github.com/LeanBitLab/LtvLauncher)).
 
 ## Requirements
 

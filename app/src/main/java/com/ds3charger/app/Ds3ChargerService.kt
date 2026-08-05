@@ -326,8 +326,37 @@ class Ds3ChargerService : Service() {
             raw >= 0xee -> 100 to (if (raw and 0x01 == 1) "Full" else "Charging")
             else -> SIXAXIS_BATTERY_CAPACITY[minOf(raw, 5)] to "On battery (not charging)"
         }
+        // Fire the charge-complete alert on the Charging->Full edge only -
+        // that's the one real transition the hardware exposes while plugged
+        // in (see the class-level comment: no live % while charging, just
+        // Charging vs Full). Guarded on the previous status specifically
+        // (not "status changed") so a fresh poll of an already-Full
+        // controller, or Full->unplugged, never fires one.
+        if (status == "Full" && state.lastStatus == "Charging" && Prefs.isChargeAlertsEnabled(this)) {
+            sendChargeCompleteAlert(state)
+        }
         state.lastBatteryPct = pct
         state.lastStatus = status
+    }
+
+    private fun sendChargeCompleteAlert(state: DeviceState) {
+        val pending = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
+        )
+        val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle("DS3 fully charged")
+            .setContentText(state.infoLine.substringBefore("\n"))
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setAutoCancel(true)
+            .setContentIntent(pending)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Unique per-device alert ID (distinct from the shared ongoing
+        // NOTIF_ID) so a second controller finishing doesn't overwrite/
+        // dismiss the first one's alert before the user sees it.
+        nm.notify(ALERT_NOTIF_ID_BASE + state.deviceId, notif)
     }
 
     private fun buildStatusText(): String {
@@ -377,10 +406,20 @@ class Ds3ChargerService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "DS3 Charger status", NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "Live battery % while a DualShock 3 is charging" }
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID, "DS3 Charger status", NotificationManager.IMPORTANCE_LOW
+                ).apply { description = "Live battery % while a DualShock 3 is charging" }
+            )
+            // Separate, higher-importance channel so charge-complete alerts
+            // actually pop/sound instead of silently updating like the
+            // ongoing status notification above (IMPORTANCE_LOW never alerts).
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    ALERT_CHANNEL_ID, "DS3 charge complete", NotificationManager.IMPORTANCE_DEFAULT
+                ).apply { description = "Alerts when a DualShock 3 finishes charging" }
+            )
         }
     }
 
@@ -402,6 +441,10 @@ class Ds3ChargerService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "ds3_charger_status"
+        private const val ALERT_CHANNEL_ID = "ds3_charger_alerts"
         private const val NOTIF_ID = 1
+        // Base for per-device alert notification IDs (see sendChargeCompleteAlert) -
+        // deviceId is a small positive int in practice, offsetting well clear of NOTIF_ID.
+        private const val ALERT_NOTIF_ID_BASE = 1000
     }
 }

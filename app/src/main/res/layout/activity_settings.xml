@@ -35,6 +35,26 @@
         android:layout_marginTop="8dp"
         android:textSize="16sp" />
 
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="22sp"
+        android:layout_marginTop="32dp"
+        android:text="Charge complete alerts" />
+
+    <Button
+        android:id="@+id/chargeAlertsToggle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp" />
+
+    <TextView
+        android:id="@+id/chargeAlertsStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textSize="16sp" />
+
     <Button
         android:id="@+id/backButton"
         android:layout_width="wrap_content"

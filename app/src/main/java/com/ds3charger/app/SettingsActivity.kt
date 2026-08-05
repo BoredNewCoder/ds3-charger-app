@@ -16,17 +16,25 @@ import android.widget.TextView
 class SettingsActivity : Activity() {
 
     private lateinit var intervalStatus: TextView
+    private lateinit var chargeAlertsToggle: Button
+    private lateinit var chargeAlertsStatus: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
 
         intervalStatus = findViewById(R.id.intervalStatus)
+        chargeAlertsToggle = findViewById(R.id.chargeAlertsToggle)
+        chargeAlertsStatus = findViewById(R.id.chargeAlertsStatus)
 
         findViewById<Button>(R.id.interval1).setOnClickListener { setInterval(1) }
         findViewById<Button>(R.id.interval5).setOnClickListener { setInterval(5) }
         findViewById<Button>(R.id.interval15).setOnClickListener { setInterval(15) }
         findViewById<Button>(R.id.interval30).setOnClickListener { setInterval(30) }
+        chargeAlertsToggle.setOnClickListener {
+            Prefs.setChargeAlertsEnabled(this, !Prefs.isChargeAlertsEnabled(this))
+            refreshUi()
+        }
         findViewById<Button>(R.id.backButton).setOnClickListener { finish() }
 
         refreshUi()
@@ -39,5 +47,11 @@ class SettingsActivity : Activity() {
 
     private fun refreshUi() {
         intervalStatus.text = "Currently: every ${Prefs.getPollIntervalMinutes(this)} min"
+        val enabled = Prefs.isChargeAlertsEnabled(this)
+        chargeAlertsToggle.text = if (enabled) "Turn off" else "Turn on"
+        chargeAlertsStatus.text = if (enabled)
+            "Currently: on - alerts when a controller finishes charging"
+        else
+            "Currently: off"
     }
 }
