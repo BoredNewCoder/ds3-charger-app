@@ -51,6 +51,11 @@ class Ds3ChargerService : Service() {
     private val BATTERY_BYTE_OFFSET = 30
     private val SIXAXIS_BATTERY_CAPACITY = intArrayOf(0, 1, 25, 50, 75, 100)
 
+    // 25, not some rounder number like 20 - it's the nearest tier the
+    // hardware can actually report (see SIXAXIS_BATTERY_CAPACITY above),
+    // so the alert fires on a real reading instead of an unreachable value.
+    private val LOW_BATTERY_THRESHOLD_PCT = 25
+
     private class DeviceState(
         var connection: UsbDeviceConnection,
         var intf: UsbInterface,
@@ -335,6 +340,16 @@ class Ds3ChargerService : Service() {
         if (status == "Full" && state.lastStatus == "Charging" && Prefs.isChargeAlertsEnabled(this)) {
             sendChargeCompleteAlert(state)
         }
+        // Edge-triggered the same way as the charge-complete alert (real
+        // previous reading required, not just "below threshold") so it
+        // fires once on the way down, not every poll while it sits low,
+        // and never on the very first poll of a freshly-connected device.
+        if (status == "On battery (not charging)" && Prefs.isLowBatteryAlertsEnabled(this) &&
+            state.lastBatteryPct != -1 && state.lastBatteryPct > LOW_BATTERY_THRESHOLD_PCT &&
+            pct <= LOW_BATTERY_THRESHOLD_PCT
+        ) {
+            sendLowBatteryAlert(state, pct)
+        }
         state.lastBatteryPct = pct
         state.lastStatus = status
     }
@@ -357,6 +372,25 @@ class Ds3ChargerService : Service() {
         // NOTIF_ID) so a second controller finishing doesn't overwrite/
         // dismiss the first one's alert before the user sees it.
         nm.notify(ALERT_NOTIF_ID_BASE + state.deviceId, notif)
+    }
+
+    private fun sendLowBatteryAlert(state: DeviceState, pct: Int) {
+        val pending = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
+        )
+        val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle("DS3 battery low ($pct%)")
+            .setContentText(state.infoLine.substringBefore("\n"))
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setAutoCancel(true)
+            .setContentIntent(pending)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Separate ID range from the charge-complete alerts (ALERT_NOTIF_ID_BASE)
+        // so both can be posted/visible independently per device.
+        nm.notify(LOW_BATTERY_NOTIF_ID_BASE + state.deviceId, notif)
     }
 
     private fun buildStatusText(): String {
@@ -417,8 +451,8 @@ class Ds3ChargerService : Service() {
             // ongoing status notification above (IMPORTANCE_LOW never alerts).
             nm.createNotificationChannel(
                 NotificationChannel(
-                    ALERT_CHANNEL_ID, "DS3 charge complete", NotificationManager.IMPORTANCE_DEFAULT
-                ).apply { description = "Alerts when a DualShock 3 finishes charging" }
+                    ALERT_CHANNEL_ID, "DS3 Charger alerts", NotificationManager.IMPORTANCE_DEFAULT
+                ).apply { description = "Alerts when a DualShock 3 finishes charging or runs low" }
             )
         }
     }
@@ -446,5 +480,6 @@ class Ds3ChargerService : Service() {
         // Base for per-device alert notification IDs (see sendChargeCompleteAlert) -
         // deviceId is a small positive int in practice, offsetting well clear of NOTIF_ID.
         private const val ALERT_NOTIF_ID_BASE = 1000
+        private const val LOW_BATTERY_NOTIF_ID_BASE = 2000
     }
 }

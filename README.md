@@ -8,7 +8,8 @@ Plug a genuine PS3 controller into anything that isn't a real PS3 (a PC, an Andr
 
 ## What this app does
 
-- Sends that operational-mode command automatically the moment a DS3 is plugged in (auto-launches via a USB device-attach intent filter — no need to open the app manually)
+- Sends that operational-mode command automatically the moment a DS3 is plugged in (auto-launches via a USB device-attach intent filter — no need to open the app manually), and also on device boot if a controller is already plugged in when the Shield powers on
+- **Low battery alert**: pops an alert notification when a controller (unplugged, running on battery) drops to 25% — toggle in Settings, on by default. 25%, not a rounder number, because it's the nearest tier the DS3 hardware can actually report
 - Reads and displays **live battery %** by polling the controller's own USB HID input report (interval adjustable in Settings — 1/5/15/30 min, default 5)
 - Runs as a foreground service with a persistent notification, so charging status keeps updating even after you leave the app
 - **Charge-complete alert**: pops a separate, actually-alerting notification (not just a silent status update) the moment a controller finishes charging — toggle in Settings, on by default. This is the one real "next charging level" event the DS3 hardware exposes; it only reports live battery % while *not* charging (see [How it works](#how-it-works)), so there's no granular 25/50/75% alert while plugged in, just the Charging → Full transition
