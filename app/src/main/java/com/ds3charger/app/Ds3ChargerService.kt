@@ -7,7 +7,9 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.bluetooth.BluetoothManager
 import android.content.IntentFilter
+import android.hardware.input.InputManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
@@ -70,6 +72,16 @@ class Ds3ChargerService : Service() {
     // otherwise, holding the interface claim and never getting evicted.
     private val MAX_POLL_FAILURES = 3
 
+    // Battery over Bluetooth (unplugged, wireless use - the actual common
+    // case, as opposed to USB-connected-but-not-charging). Read via
+    // Android's own InputDevice battery API (real public API since Android
+    // 12/API 31, sourced from the same kernel power_supply node the DS3's
+    // hid-sony driver already exposes) - completely separate code path
+    // from the USB control-transfer polling above, since UsbManager has no
+    // visibility into a Bluetooth-only connection at all.
+    private class BtDeviceState(val descriptor: String, val name: String, var lastBatteryPct: Int = -1)
+    private val btDevices = java.util.Collections.synchronizedMap(mutableMapOf<String, BtDeviceState>())
+
     // synchronizedMap since bgHandler (poll/charge-command work) and the main
     // thread (USB_DEVICE_DETACHED) both mutate this.
     private val devices = java.util.Collections.synchronizedMap(mutableMapOf<Int, DeviceState>())
@@ -126,6 +138,7 @@ class Ds3ChargerService : Service() {
             // controlTransfer calls shouldn't hold the map lock the whole time.
             val snapshot = synchronized(devices) { devices.values.toList() }
             snapshot.forEach { pollBattery(it) }
+            pollBluetoothControllers()
             // Single refresh after the whole batch - pollBattery used to call
             // this per-device, so N controllers meant N notify()/listener
             // calls per tick instead of 1.
@@ -375,13 +388,17 @@ class Ds3ChargerService : Service() {
     }
 
     private fun sendLowBatteryAlert(state: DeviceState, pct: Int) {
+        sendLowBatteryAlertFor(state.infoLine.substringBefore("\n"), pct, LOW_BATTERY_NOTIF_ID_BASE + state.deviceId)
+    }
+
+    private fun sendLowBatteryAlertFor(deviceDescription: String, pct: Int, notifId: Int) {
         val pending = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
         )
         val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
             .setContentTitle("DS3 battery low ($pct%)")
-            .setContentText(state.infoLine.substringBefore("\n"))
+            .setContentText(deviceDescription)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setAutoCancel(true)
             .setContentIntent(pending)
@@ -390,18 +407,80 @@ class Ds3ChargerService : Service() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         // Separate ID range from the charge-complete alerts (ALERT_NOTIF_ID_BASE)
         // so both can be posted/visible independently per device.
-        nm.notify(LOW_BATTERY_NOTIF_ID_BASE + state.deviceId, notif)
+        nm.notify(notifId, notif)
+    }
+
+    // Skips entirely while any USB-connected controller is tracked - that
+    // path already gives richer, faster, real-time battery data for the
+    // common single-controller case, so there's no need to double-track
+    // the same physical unit over two different code paths. A controller
+    // that's genuinely wireless-only (never plugged in this session) is
+    // unaffected by this check.
+    private fun pollBluetoothControllers() {
+        if (devices.isNotEmpty()) return
+        val im = getSystemService(Context.INPUT_SERVICE) as InputManager
+        val seen = mutableSetOf<String>()
+        for (id in im.inputDeviceIds) {
+            val dev = im.getInputDevice(id) ?: continue
+            if (dev.vendorId != SONY_VENDOR_ID || dev.productId != DS3_PRODUCT_ID) continue
+            seen.add(dev.descriptor)
+            val pct = readBluetoothBatteryPct(dev) ?: continue
+            val state = btDevices.getOrPut(dev.descriptor) { BtDeviceState(dev.descriptor, dev.name) }
+            if (Prefs.isLowBatteryAlertsEnabled(this) &&
+                state.lastBatteryPct != -1 && state.lastBatteryPct > LOW_BATTERY_THRESHOLD_PCT &&
+                pct <= LOW_BATTERY_THRESHOLD_PCT
+            ) {
+                sendLowBatteryAlertFor(state.name, pct, LOW_BATTERY_NOTIF_ID_BASE + dev.id)
+            }
+            state.lastBatteryPct = pct
+        }
+        // Drop entries for controllers that disconnected, so a later
+        // reconnect starts fresh (no stale baseline for the edge check).
+        btDevices.keys.retainAll(seen)
+    }
+
+    // Prefers the real public API (InputDevice.getBatteryState(), Android
+    // 12/API 31+). Falls back to BluetoothDevice.getBatteryLevel() - a
+    // long-standing but @hide, undocumented AOSP method, not in the public
+    // SDK - for older OS versions like this Shield's Android 11, since
+    // there's no public alternative there at all. Matched to the input
+    // device by name (InputDevice has no MAC to match on directly).
+    // Unofficial, so wrapped defensively: any failure here just means no
+    // Bluetooth battery reading this poll, not a crash.
+    private fun readBluetoothBatteryPct(dev: android.view.InputDevice): Int? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val battery = dev.batteryState
+            if (battery != null && battery.isPresent && !battery.capacity.isNaN()) {
+                return (battery.capacity * 100).toInt().coerceIn(0, 100)
+            }
+            return null
+        }
+        return try {
+            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return null
+            val adapter = btManager.adapter ?: return null
+            val match = adapter.bondedDevices?.firstOrNull { it.name == dev.name } ?: return null
+            val method = match.javaClass.getMethod("getBatteryLevel")
+            val level = method.invoke(match) as? Int ?: return null
+            if (level < 0 || level > 100) null else level
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun buildStatusText(): String {
         val snapshot = synchronized(devices) { devices.values.toList() }
-        if (snapshot.isEmpty()) {
+        val btSnapshot = synchronized(btDevices) { btDevices.values.toList() }
+        if (snapshot.isEmpty() && btSnapshot.isEmpty()) {
             return "No DualShock 3 connected.\nPlug it in (this app will auto-launch), or leave this open and plug it in now."
         }
         val time = timeFmt.format(java.util.Date())
-        return snapshot.joinToString("\n\n") { s ->
+        val usbText = snapshot.map { s ->
             "${s.infoLine}\n[$time] Battery: ${s.lastBatteryPct}%  (${s.lastStatus})"
         }
+        val btText = btSnapshot.map { s ->
+            "${s.name} (Bluetooth)\n[$time] Battery: ${s.lastBatteryPct}%  (wireless - not charging)"
+        }
+        return (usbText + btText).joinToString("\n\n")
     }
 
     private fun refreshUi() {
@@ -411,10 +490,13 @@ class Ds3ChargerService : Service() {
 
     private fun updateNotification() {
         val snapshot = synchronized(devices) { devices.values.toList() }
-        val text = if (snapshot.isEmpty()) {
+        val btSnapshot = synchronized(btDevices) { btDevices.values.toList() }
+        val text = if (snapshot.isEmpty() && btSnapshot.isEmpty()) {
             "No controller connected"
         } else {
-            snapshot.joinToString("  |  ") { "${it.lastBatteryPct}% ${it.lastStatus}" }
+            val usbParts = snapshot.map { "${it.lastBatteryPct}% ${it.lastStatus}" }
+            val btParts = btSnapshot.map { "${it.lastBatteryPct}% wireless" }
+            (usbParts + btParts).joinToString("  |  ")
         }
         // Skip the notify() call entirely when nothing changed since last
         // tick - every poll used to rewrite the notification unconditionally.

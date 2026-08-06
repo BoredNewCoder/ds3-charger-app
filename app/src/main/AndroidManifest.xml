@@ -9,6 +9,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Legacy-only (maxSdkVersion 30): needed for the BluetoothDevice
+         reflection fallback used on Android 11 and below, where there's no
+         public battery API - see readBluetoothBatteryPct()'s doc comment
+         in Ds3ChargerService. Not requested on 31+, where the public
+         InputDevice battery API is used instead and needs no permission. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
     <application
         android:allowBackup="true"
