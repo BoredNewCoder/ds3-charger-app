@@ -66,26 +66,32 @@ class Ds3ChargerService : Service() {
     // but the stick/button offsets aren't custom-parsed by hid-sony.c (unlike
     // battery/motion, which the kernel driver hand-decodes) - sticks/buttons
     // are standard HID, generically mapped from the device's own report
-    // descriptor. Sourced from the DS3's actual HID Report Descriptor
-    // (eleccelerator.com/wiki DualShock_3, archived snapshot fetched
-    // 2026-08-13 after the live page was Cloudflare-blocked): bytes 6-9 are
-    // left stick X/Y and right stick X/Y; bytes 13-24 are 12 analog pressure
-    // values (D-pad x4, L2/R2/L1/R1, Triangle/Circle/Cross/Square), 0=released
-    // to 255=fully pressed. Genuine Sony hardware uses a real (~10-bit) ADC on
-    // these; cheap clone boards commonly upscale a coarser (4-bit/8-bit) ADC
-    // to fit the 8-bit report field, so a slow sweep only ever lands on a few
-    // widely, evenly spaced values instead of many close ones. Not
-    // cryptographic proof - a worn/aged pot on genuine hardware could look
-    // ambiguous too - but a real, sourced, immutable-hardware signal, unlike
-    // the rewritable Bluetooth pairing MAC the first version of this check
-    // used (reverted 2026-08-13 - see project memory for why that was wrong).
+    // descriptor. Bytes 6-9 are left stick X/Y and right stick X/Y; bytes
+    // 14-25 are 12 analog pressure values (D-pad x4, L2/R2/L1/R1,
+    // Triangle/Circle/Cross/Square), 0=released to 255=fully pressed.
+    // Pressure-byte offsets corrected 2026-08-13 (was 13-24, off by one) -
+    // cross-checked against DsHidMini's real, actively-maintained driver
+    // source (github.com/nefarius/DsHidMini, include/DsHidMini/Ds3Types.h,
+    // DS3_RAW_INPUT_REPORT struct - counting its fields byte-by-byte lands
+    // Pressure at offset 14 and BatteryStatus at offset 30, confirming
+    // BATTERY_BYTE_OFFSET above was always right but the original
+    // eleccelerator.com/wiki-sourced pressure range was one byte early.
+    // Stick offsets (6-9) and BatteryStatus (30) agree across both sources.
+    // Genuine Sony hardware uses a real (~10-bit) ADC on these; cheap clone
+    // boards commonly upscale a coarser (4-bit/8-bit) ADC to fit the 8-bit
+    // report field, so a slow sweep only ever lands on a few widely, evenly
+    // spaced values instead of many close ones. Not cryptographic proof - a
+    // worn/aged pot on genuine hardware could look ambiguous too - but a
+    // real, sourced, immutable-hardware signal, unlike the rewritable
+    // Bluetooth pairing MAC the first version of this check used (reverted
+    // 2026-08-13 - see project memory for why that was wrong).
     private val AUTH_CHECK_STICK_OFFSETS = intArrayOf(6, 7, 8, 9)
-    private val AUTH_CHECK_PRESSURE_OFFSETS = (13..24).toList().toIntArray()
+    private val AUTH_CHECK_PRESSURE_OFFSETS = (14..25).toList().toIntArray()
     private val AUTH_CHECK_LABELS = mapOf(
         6 to "Left stick X", 7 to "Left stick Y", 8 to "Right stick X", 9 to "Right stick Y",
-        13 to "D-pad Left", 14 to "D-pad Down", 15 to "D-pad Right", 16 to "D-pad Up",
-        17 to "L2", 18 to "R2", 19 to "L1", 20 to "R1",
-        21 to "Triangle", 22 to "Circle", 23 to "Cross", 24 to "Square",
+        14 to "D-pad Left", 15 to "D-pad Down", 16 to "D-pad Right", 17 to "D-pad Up",
+        18 to "L2", 19 to "R2", 20 to "L1", 21 to "R1",
+        22 to "Triangle", 23 to "Circle", 24 to "Cross", 25 to "Square",
     )
     private val AUTH_CHECK_DURATION_MS = 6000L
     private val AUTH_CHECK_SAMPLE_INTERVAL_MS = 50L
@@ -382,6 +388,8 @@ class Ds3ChargerService : Service() {
         val result2 = connection.controlTransfer(0xA1, 0x01, 0x03F5, intf.id, buf2, buf2.size, 5000)
         if (result2 < 0) {
             Log.w("Ds3Charger", "operational step 2 (0xF5) failed, result=$result2 - continuing anyway")
+        } else {
+            Log.d("Ds3Charger", "operational step 2 (0xF5) OK, result=$result2 bytes=${buf2.take(8)}")
         }
 
         // Release right away - holding it exclusively blocks any other
@@ -510,7 +518,9 @@ class Ds3ChargerService : Service() {
                 0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, state.intf.id, buf, buf.size, 500
             )
             state.connection.releaseInterface(state.intf)
-            if (result > 24) {
+            // Highest offset now read is 25 (Square) - need at least 26 bytes
+            // for buf[25] to be real data, not an unwritten zero.
+            if (result > 25) {
                 for (off in allOffsets) samples.getValue(off).add(buf[off].toInt() and 0xFF)
             }
             Thread.sleep(AUTH_CHECK_SAMPLE_INTERVAL_MS)
