@@ -20,4 +20,19 @@
         android:layout_marginTop="32dp"
         android:text="Settings" />
 
+    <Button
+        android:id="@+id/authCheckButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Check Authenticity" />
+
+    <TextView
+        android:id="@+id/authCheckResult"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:textSize="16sp"
+        android:gravity="center" />
+
 </LinearLayout>

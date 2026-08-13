@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -57,6 +58,40 @@ class Ds3ChargerService : Service() {
     // hardware can actually report (see SIXAXIS_BATTERY_CAPACITY above),
     // so the alert fires on a real reading instead of an unreachable value.
     private val LOW_BATTERY_THRESHOLD_PCT = 25
+
+    // Authenticity check: same 49-byte input report as the battery byte above,
+    // but the stick/button offsets aren't custom-parsed by hid-sony.c (unlike
+    // battery/motion, which the kernel driver hand-decodes) - sticks/buttons
+    // are standard HID, generically mapped from the device's own report
+    // descriptor. Sourced from the DS3's actual HID Report Descriptor
+    // (eleccelerator.com/wiki DualShock_3, archived snapshot fetched
+    // 2026-08-13 after the live page was Cloudflare-blocked): bytes 6-9 are
+    // left stick X/Y and right stick X/Y; bytes 13-24 are 12 analog pressure
+    // values (D-pad x4, L2/R2/L1/R1, Triangle/Circle/Cross/Square), 0=released
+    // to 255=fully pressed. Genuine Sony hardware uses a real (~10-bit) ADC on
+    // these; cheap clone boards commonly upscale a coarser (4-bit/8-bit) ADC
+    // to fit the 8-bit report field, so a slow sweep only ever lands on a few
+    // widely, evenly spaced values instead of many close ones. Not
+    // cryptographic proof - a worn/aged pot on genuine hardware could look
+    // ambiguous too - but a real, sourced, immutable-hardware signal, unlike
+    // the rewritable Bluetooth pairing MAC the first version of this check
+    // used (reverted 2026-08-13 - see project memory for why that was wrong).
+    private val AUTH_CHECK_STICK_OFFSETS = intArrayOf(6, 7, 8, 9)
+    private val AUTH_CHECK_PRESSURE_OFFSETS = (13..24).toList().toIntArray()
+    private val AUTH_CHECK_LABELS = mapOf(
+        6 to "Left stick X", 7 to "Left stick Y", 8 to "Right stick X", 9 to "Right stick Y",
+        13 to "D-pad Left", 14 to "D-pad Down", 15 to "D-pad Right", 16 to "D-pad Up",
+        17 to "L2", 18 to "R2", 19 to "L1", 20 to "R1",
+        21 to "Triangle", 22 to "Circle", 23 to "Cross", 24 to "Square",
+    )
+    private val AUTH_CHECK_DURATION_MS = 6000L
+    private val AUTH_CHECK_SAMPLE_INTERVAL_MS = 50L
+    // Gate out channels the user didn't actually move enough to judge fairly.
+    private val AUTH_CHECK_MIN_RANGE = 40
+    private val AUTH_CHECK_MIN_DISTINCT = 5
+    // A gap this size or larger between consecutive OBSERVED values on the
+    // channel with the most movement is the coarse-ADC tell.
+    private val AUTH_CHECK_COARSE_GAP = 8
 
     private class DeviceState(
         var connection: UsbDeviceConnection,
@@ -116,10 +151,17 @@ class Ds3ChargerService : Service() {
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var listener: Listener? = null
     private var lastNotifiedText: String? = null
+    // Only for posting auth-check callbacks back to the UI thread - bgHandler
+    // (where the check's sampling loop runs) is a background HandlerThread.
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     interface Listener {
         fun onStatusUpdate(text: String)
+        fun onAuthCheckProgress(secondsLeft: Int) {}
+        fun onAuthCheckDone(result: AuthCheckResult) {}
     }
+
+    data class AuthCheckResult(val verdict: String, val detail: String)
 
     fun setListener(l: Listener?) {
         listener = l
@@ -286,14 +328,8 @@ class Ds3ChargerService : Service() {
         val name = try {
             "${device.manufacturerName ?: "Sony"} ${device.productName ?: "PLAYSTATION(R)3 Controller"}"
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
-        // This same 0xF2 buffer (already being read for the wake command above)
-        // also carries the controller's own Bluetooth MAC - free authenticity
-        // signal, no extra USB transfer needed.
-        val mac = extractMacFromF2(buf, result)
-        val authNote = mac?.let { authenticityLabel(it) } ?: "MAC unavailable - can't verify"
         val infoLine = "Device: $name\nVID=0x${device.vendorId.toString(16)} " +
-            "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}\n" +
-            (mac?.let { "MAC=$it  " } ?: "") + authNote
+            "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
         synchronized(devices) {
             devices[device.deviceId] = DeviceState(connection, intf, infoLine, device.deviceId)
             pendingDeviceIds.remove(device.deviceId)
@@ -316,35 +352,6 @@ class Ds3ChargerService : Service() {
             { sendChargeCommandAttempt(device, attempt + 1) },
             CHARGE_COMMAND_RETRY_BASE_DELAY_MS * attempt
         )
-    }
-
-    // Kernel source (drivers/hid/hid-sony.c, SIXAXIS_REPORT_0xF2_SIZE=17): "The MAC
-    // address of a Sixaxis controller connected via USB can be retrieved with feature
-    // report 0xf2. The address begins at offset 4" - stored REVERSED
-    // (mac_address[5-n] = buf[4+n]). `result` is the actual byte count the
-    // controlTransfer returned, not just buf.size (a static 17-byte allocation) -
-    // a short/partial read must not be trusted past what was really written back.
-    private fun extractMacFromF2(buf: ByteArray, result: Int): String? {
-        if (result < 10) return null
-        val mac = ByteArray(6)
-        for (n in 0..5) mac[5 - n] = buf[4 + n]
-        return mac.joinToString(":") { "%02X".format(it) }
-    }
-
-    // Real IEEE OUI registry lookup (standards-oui.ieee.org, fetched 2026-08-13) -
-    // every MAC-address block ever registered to a Sony entity (Corporation,
-    // Interactive Entertainment, Computer Entertainment America, etc). Sony
-    // manufactures genuine controllers with a MAC from a block IT owns; it doesn't
-    // buy ranges from third parties. A clone/counterfeit board almost always ships
-    // with a MAC from whatever generic chip vendor made it - not Sony-registered.
-    // Not cryptographic proof (a sophisticated clone could spoof a real Sony MAC),
-    // but a real, verifiable signal, same rigor as this app's other hardware-quirk
-    // checks (see the battery-byte-offset citation above).
-    private fun authenticityLabel(mac: String): String {
-        val oui = mac.replace(":", "").take(6).uppercase()
-        if (oui == "000000") return "MAC unavailable - can't verify"
-        return if (oui in SONY_OUI_PREFIXES) "Genuine Sony hardware (MAC OUI verified)"
-        else "MAC not Sony-registered - likely a clone/counterfeit"
     }
 
     private fun pollBattery(state: DeviceState) {
@@ -400,6 +407,101 @@ class Ds3ChargerService : Service() {
         }
         state.lastBatteryPct = pct
         state.lastStatus = status
+    }
+
+    // Returns the first USB-connected DS3's deviceId, or null if none - this
+    // screen only ever drives one check at a time, matching MainActivity's
+    // existing single-status-blob UX (it doesn't offer per-device selection
+    // anywhere else either).
+    fun firstConnectedDeviceId(): Int? = synchronized(devices) { devices.keys.firstOrNull() }
+
+    // Runs on the caller's thread if called directly - always call via
+    // bgHandler.post from outside this class (MainActivity does).
+    fun startAuthenticityCheck(deviceId: Int) {
+        val state = devices[deviceId]
+        if (state == null) {
+            listener?.onAuthCheckDone(AuthCheckResult("Not connected", "Plug in the controller first."))
+            return
+        }
+        bgHandler.post { runAuthenticityCheck(state) }
+    }
+
+    // Blocks bgHandler for the check's duration (same thread pollBattery/
+    // sendChargeCommand already use for their own blocking control transfers)
+    // - other tracked controllers' polling is delayed for these few seconds,
+    // acceptable since this is a rare, short, user-initiated one-off action,
+    // not continuous work.
+    private fun runAuthenticityCheck(state: DeviceState) {
+        val allOffsets = AUTH_CHECK_STICK_OFFSETS + AUTH_CHECK_PRESSURE_OFFSETS
+        val samples = allOffsets.associateWith { mutableListOf<Int>() }
+
+        val startTime = System.currentTimeMillis()
+        val endTime = startTime + AUTH_CHECK_DURATION_MS
+        var lastSecondReported = -1
+
+        while (System.currentTimeMillis() < endTime) {
+            val elapsedMs = System.currentTimeMillis() - startTime
+            val secondsLeft = ((AUTH_CHECK_DURATION_MS - elapsedMs) / 1000).toInt() + 1
+            if (secondsLeft != lastSecondReported) {
+                lastSecondReported = secondsLeft
+                mainHandler.post { listener?.onAuthCheckProgress(secondsLeft) }
+            }
+            state.connection.claimInterface(state.intf, true)
+            val buf = ByteArray(INPUT_REPORT_SIZE)
+            val result = state.connection.controlTransfer(
+                0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, state.intf.id, buf, buf.size, 500
+            )
+            state.connection.releaseInterface(state.intf)
+            if (result > 24) {
+                for (off in allOffsets) samples.getValue(off).add(buf[off].toInt() and 0xFF)
+            }
+            Thread.sleep(AUTH_CHECK_SAMPLE_INTERVAL_MS)
+        }
+
+        val result = analyzeAuthCheck(samples)
+        mainHandler.post { listener?.onAuthCheckDone(result) }
+    }
+
+    private fun analyzeAuthCheck(samples: Map<Int, List<Int>>): AuthCheckResult {
+        var bestOffset = -1
+        var bestRange = 0
+        var bestDistinct = 0
+        var bestMinGap = 0
+
+        for ((offset, values) in samples) {
+            val distinct = values.toSortedSet()
+            val range = (distinct.maxOrNull() ?: 0) - (distinct.minOrNull() ?: 0)
+            if (range < AUTH_CHECK_MIN_RANGE || distinct.size < AUTH_CHECK_MIN_DISTINCT) continue
+            val minGap = distinct.toList().zipWithNext { a, b -> b - a }.minOrNull() ?: 0
+            if (range > bestRange) {
+                bestRange = range
+                bestOffset = offset
+                bestDistinct = distinct.size
+                bestMinGap = minGap
+            }
+        }
+
+        if (bestOffset == -1) {
+            return AuthCheckResult(
+                "Not enough movement",
+                "Move a stick through its full range, or press a button gradually (not just tap it), while the check runs."
+            )
+        }
+
+        val label = AUTH_CHECK_LABELS[bestOffset] ?: "channel"
+        return if (bestMinGap >= AUTH_CHECK_COARSE_GAP) {
+            AuthCheckResult(
+                "Stepped response - clone-typical",
+                "$label: only $bestDistinct distinct values across a range of $bestRange, smallest gap $bestMinGap. " +
+                    "A coarse, evenly-spaced jump like this matches a low-resolution ADC upscaled to fit the report."
+            )
+        } else {
+            AuthCheckResult(
+                "Smooth response - genuine-consistent",
+                "$label: $bestDistinct distinct values across a range of $bestRange, smallest gap $bestMinGap. " +
+                    "Fine-grained variation like this is consistent with genuine Sony hardware."
+            )
+        }
     }
 
     private fun sendChargeCompleteAlert(state: DeviceState) {
@@ -598,29 +700,5 @@ class Ds3ChargerService : Service() {
         // deviceId is a small positive int in practice, offsetting well clear of NOTIF_ID.
         private const val ALERT_NOTIF_ID_BASE = 1000
         private const val LOW_BATTERY_NOTIF_ID_BASE = 2000
-
-        // Every Sony-registered MAC OUI block (standards-oui.ieee.org, fetched
-        // 2026-08-13, filtered case-insensitively for "sony" across all their
-        // corporate entity names). 6 hex chars each, no separators, uppercase.
-        private val SONY_OUI_PREFIXES = setOf(
-            "000095", "00014A", "00041F", "000AD9", "000E07", "000FDE", "0012EE", "001315",
-            "0013A9", "0015C1", "001620", "0016B8", "001813", "001963", "0019C5", "001A75",
-            "001A80", "001B59", "001CA4", "001D0D", "001D28", "001DBA", "001E45", "001EDC",
-            "001FA7", "001FE4", "00219E", "002298", "0022A6", "002345", "0023F1", "00248D",
-            "0024BE", "0024EF", "0025E7", "00D9D1", "00E421", "00EB2D", "045D4B", "04F778",
-            "080046", "0C7043", "0CFE45", "104FA8", "143FA6", "18002D", "1C7B21", "205476",
-            "2421AB", "280DFC", "283F69", "2840DD", "2C97ED", "2C9E00", "2CCC44", "3017C8",
-            "303926", "307512", "30A8DB", "30F9ED", "38184C", "387862", "3C01EF", "3C0771",
-            "3C38F4", "402BA1", "4040A7", "40B837", "44746C", "44D4E0", "4C21D0", "50125C",
-            "50B03B", "54263D", "544249", "5453ED", "54E6FD", "58170C", "581862", "584822",
-            "5C843C", "5C9666", "5CB524", "68286C", "68764F", "6C0E0D", "6C23B9", "6CB227",
-            "702605", "70662A", "709E29", "78843C", "78C881", "8099E7", "8400D2", "848EDF",
-            "84C7EA", "84E657", "88C9E8", "8C6422", "904748", "90C115", "94CE2C", "94DB56",
-            "98FA2E", "9C37CB", "9C5CF9", "A0E453", "A8E3EE", "AC800A", "AC9B0A", "B40AD8",
-            "B41F4D", "B4527D", "B4527E", "B8F934", "BC3329", "BC60A7", "BC6E64", "C0151B",
-            "C43ABE", "C84AA0", "C863F1", "CC988B", "D05162", "D4389C", "D4F7D5", "D8D43C",
-            "E063E5", "E86E3A", "EC748C", "F0BF97", "F46412", "F8461C", "F84E17", "F8D0AC",
-            "FC0FE6", "FCCA40", "FCF152",
-        )
     }
 }

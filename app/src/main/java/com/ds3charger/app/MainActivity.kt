@@ -24,6 +24,8 @@ import android.widget.TextView
 class MainActivity : Activity(), Ds3ChargerService.Listener {
 
     private lateinit var statusView: TextView
+    private lateinit var authCheckButton: Button
+    private lateinit var authCheckResultView: TextView
     private var service: Ds3ChargerService? = null
     private var bound = false
 
@@ -41,8 +43,20 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         statusView = findViewById(R.id.statusText)
+        authCheckButton = findViewById(R.id.authCheckButton)
+        authCheckResultView = findViewById(R.id.authCheckResult)
         findViewById<Button>(R.id.settingsButton).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        authCheckButton.setOnClickListener {
+            val deviceId = service?.firstConnectedDeviceId()
+            if (deviceId == null) {
+                authCheckResultView.text = "No controller connected."
+                return@setOnClickListener
+            }
+            authCheckButton.isEnabled = false
+            authCheckResultView.text = "Move a stick or press a button gently - checking..."
+            service?.startAuthenticityCheck(deviceId)
         }
 
         requestNotificationPermissionIfNeeded()
@@ -66,6 +80,17 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
 
     override fun onStatusUpdate(text: String) {
         runOnUiThread { statusView.text = text }
+    }
+
+    override fun onAuthCheckProgress(secondsLeft: Int) {
+        runOnUiThread { authCheckResultView.text = "Checking... ${secondsLeft}s left - keep moving the stick/button" }
+    }
+
+    override fun onAuthCheckDone(result: Ds3ChargerService.AuthCheckResult) {
+        runOnUiThread {
+            authCheckButton.isEnabled = true
+            authCheckResultView.text = "${result.verdict}\n${result.detail}"
+        }
     }
 
     override fun onStop() {
