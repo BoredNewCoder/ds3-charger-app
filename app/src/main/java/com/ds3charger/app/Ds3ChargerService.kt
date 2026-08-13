@@ -10,8 +10,10 @@ import android.content.Intent
 import android.bluetooth.BluetoothManager
 import android.content.IntentFilter
 import android.hardware.input.InputManager
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Binder
@@ -20,6 +22,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -93,6 +96,32 @@ class Ds3ChargerService : Service() {
     // channel with the most movement is the coarse-ADC tell.
     private val AUTH_CHECK_COARSE_GAP = 8
 
+    // Rumble test. Real Linux kernel struct (drivers/hid/hid-sony.c,
+    // sixaxis_send_output_report + struct sixaxis_rumble/sixaxis_output_report):
+    // 36-byte OUTPUT report, ID 0x01, sent via SET_REPORT (bmRequestType 0x21,
+    // bRequest 0x09, wValue 0x0201 = report type Output(2)<<8 | report id 1).
+    // Byte 0 = report id. Bytes 1-5 = rumble{padding, right_duration
+    // (0xff=forever until told otherwise), right_motor_on(0/1, small motor),
+    // left_duration(0xff=forever), left_motor_force(0-255, large motor)}.
+    // Bytes 6-9 = padding. Byte 10 = LED bitmap. Bytes 11-35 = four 5-byte LED
+    // blink configs + one reserved slot - copied verbatim from the kernel's
+    // own default_report array so LED state is left exactly as the real
+    // driver would, only the rumble bytes are touched for this test.
+    private val SIXAXIS_OUTPUT_DEFAULT = byteArrayOf(
+        0x01,
+        0x01, 0xff.toByte(), 0x00, 0xff.toByte(), 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+        0xff.toByte(), 0x27, 0x10, 0x00, 0x32,
+        0xff.toByte(), 0x27, 0x10, 0x00, 0x32,
+        0xff.toByte(), 0x27, 0x10, 0x00, 0x32,
+        0xff.toByte(), 0x27, 0x10, 0x00, 0x32,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    )
+    // Max force - a steady burst and a pulsed pattern were both barely
+    // perceptible in a live test at max force, hence the per-motor isolation
+    // diagnostic in testRumble() below.
+    private val RUMBLE_TEST_FORCE = 0xFF.toByte()
+
     private class DeviceState(
         var connection: UsbDeviceConnection,
         var intf: UsbInterface,
@@ -101,6 +130,7 @@ class Ds3ChargerService : Service() {
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
         var consecutivePollFailures: Int = 0,
+        var authCheckResult: AuthCheckResult? = null,
     )
 
     // A dead/gone connection just sits reporting "unavailable" forever
@@ -157,15 +187,32 @@ class Ds3ChargerService : Service() {
 
     interface Listener {
         fun onStatusUpdate(text: String)
-        fun onAuthCheckProgress(secondsLeft: Int) {}
-        fun onAuthCheckDone(result: AuthCheckResult) {}
+        fun onDevicesUpdate(cards: List<DeviceCardInfo>) {}
+        fun onAuthCheckProgress(deviceId: Int, secondsLeft: Int) {}
+        fun onAuthCheckDone(deviceId: Int, result: AuthCheckResult) {}
     }
 
     data class AuthCheckResult(val verdict: String, val detail: String)
 
+    // One per connected controller (USB or Bluetooth) - lets MainActivity
+    // render a distinct card per device instead of one joined text blob,
+    // and wire per-device Check Authenticity / Test Rumble buttons.
+    // deviceId is only meaningful (non-null) for USB devices, since that's
+    // the only kind startAuthenticityCheck/testRumble can act on - a
+    // Bluetooth-only entry can't run either (UsbManager has no visibility
+    // into it), so its card just omits those buttons on the UI side.
+    data class DeviceCardInfo(
+        val deviceId: Int?,
+        val title: String,
+        val detail: String,
+        val batteryLine: String,
+        val authLine: String?,
+    )
+
     fun setListener(l: Listener?) {
         listener = l
         l?.onStatusUpdate(buildStatusText())
+        l?.onDevicesUpdate(buildDeviceCards())
     }
 
     inner class LocalBinder : Binder() {
@@ -409,21 +456,15 @@ class Ds3ChargerService : Service() {
         state.lastStatus = status
     }
 
-    // Returns the first USB-connected DS3's deviceId, or null if none - this
-    // screen only ever drives one check at a time, matching MainActivity's
-    // existing single-status-blob UX (it doesn't offer per-device selection
-    // anywhere else either).
-    fun firstConnectedDeviceId(): Int? = synchronized(devices) { devices.keys.firstOrNull() }
-
     // Runs on the caller's thread if called directly - always call via
     // bgHandler.post from outside this class (MainActivity does).
     fun startAuthenticityCheck(deviceId: Int) {
         val state = devices[deviceId]
         if (state == null) {
-            listener?.onAuthCheckDone(AuthCheckResult("Not connected", "Plug in the controller first."))
+            mainHandler.post { listener?.onAuthCheckDone(deviceId, AuthCheckResult("Not connected", "Plug in the controller first.")) }
             return
         }
-        bgHandler.post { runAuthenticityCheck(state) }
+        bgHandler.post { runAuthenticityCheck(deviceId, state) }
     }
 
     // Blocks bgHandler for the check's duration (same thread pollBattery/
@@ -431,7 +472,7 @@ class Ds3ChargerService : Service() {
     // - other tracked controllers' polling is delayed for these few seconds,
     // acceptable since this is a rare, short, user-initiated one-off action,
     // not continuous work.
-    private fun runAuthenticityCheck(state: DeviceState) {
+    private fun runAuthenticityCheck(deviceId: Int, state: DeviceState) {
         val allOffsets = AUTH_CHECK_STICK_OFFSETS + AUTH_CHECK_PRESSURE_OFFSETS
         val samples = allOffsets.associateWith { mutableListOf<Int>() }
 
@@ -444,7 +485,7 @@ class Ds3ChargerService : Service() {
             val secondsLeft = ((AUTH_CHECK_DURATION_MS - elapsedMs) / 1000).toInt() + 1
             if (secondsLeft != lastSecondReported) {
                 lastSecondReported = secondsLeft
-                mainHandler.post { listener?.onAuthCheckProgress(secondsLeft) }
+                mainHandler.post { listener?.onAuthCheckProgress(deviceId, secondsLeft) }
             }
             state.connection.claimInterface(state.intf, true)
             val buf = ByteArray(INPUT_REPORT_SIZE)
@@ -459,7 +500,97 @@ class Ds3ChargerService : Service() {
         }
 
         val result = analyzeAuthCheck(samples)
-        mainHandler.post { listener?.onAuthCheckDone(result) }
+        // Persisted on the DeviceState so it survives an Activity
+        // rebind/reopen without re-running the check - buildDeviceCards()
+        // reads it back into authLine every refresh.
+        state.authCheckResult = result
+        mainHandler.post { listener?.onAuthCheckDone(deviceId, result) }
+    }
+
+    // Continuous 1s rumble, motors alternating (each output report is a full
+    // state snapshot, so switching straight from one motor's report to the
+    // other's turns the first off and the second on in the same command -
+    // no gap). Always ends on an explicit off - right/left duration in the
+    // report is 0xff ("forever") so skipping it would leave it buzzing.
+    private val RUMBLE_SEGMENT_MS = 125L
+    private val RUMBLE_SEGMENTS = 8  // 8 * 125ms = 1000ms
+
+    fun testRumble(deviceId: Int) {
+        val state = devices[deviceId]
+        if (state == null) {
+            Log.w("Ds3Charger", "testRumble: no tracked device for id=$deviceId")
+            return
+        }
+        bgHandler.post {
+            val rightOnly = SIXAXIS_OUTPUT_DEFAULT.copyOf().apply { this[3] = 1 }
+            val leftOnly = SIXAXIS_OUTPUT_DEFAULT.copyOf().apply { this[5] = RUMBLE_TEST_FORCE }
+            for (i in 0 until RUMBLE_SEGMENTS) {
+                sendOutputReport(state, if (i % 2 == 0) rightOnly else leftOnly)
+                Thread.sleep(RUMBLE_SEGMENT_MS)
+            }
+            sendOutputReport(state, SIXAXIS_OUTPUT_DEFAULT)
+        }
+    }
+
+    // Writes the DS3's stored Bluetooth "master" address - the host it will
+    // try to reconnect to wirelessly. Real DS3 pairing is USB-write-driven,
+    // not a self-contained discoverable Bluetooth mode - this is exactly
+    // what a real PS3 does automatically on first USB connect, and what
+    // PC pairing tools (SixaxisPairTool etc) do manually. Sourced from
+    // Android's own historical bluez sixpair.c (set_master_bdaddr):
+    // SET_REPORT, feature report 0xF5, 8-byte message
+    // [0x01, 0x00, mac0, mac1, mac2, mac3, mac4, mac5] - mac in NATURAL
+    // order here, unlike the 0xF2 read path (extractMacFromF2, since
+    // removed) which was byte-reversed - these are two independently
+    // defined report layouts, not required to share byte order.
+    fun pairToHost(deviceId: Int, hostMac: String) {
+        val state = devices[deviceId]
+        if (state == null) {
+            Log.w("Ds3Charger", "pairToHost: no tracked device for id=$deviceId")
+            return
+        }
+        val macBytes = try {
+            hostMac.split(":").map { it.toInt(16).toByte() }
+        } catch (e: Exception) { null }
+        if (macBytes == null || macBytes.size != 6) {
+            Log.w("Ds3Charger", "pairToHost: bad MAC format: $hostMac")
+            return
+        }
+        val msg = ByteArray(8)
+        msg[0] = 0x01
+        msg[1] = 0x00
+        for (i in 0..5) msg[2 + i] = macBytes[i]
+        bgHandler.post {
+            state.connection.claimInterface(state.intf, true)
+            val result = state.connection.controlTransfer(0x21, 0x09, 0x03f5, state.intf.id, msg, msg.size, 5000)
+            state.connection.releaseInterface(state.intf)
+            Log.d("Ds3Charger", "pairToHost: mac=$hostMac result=$result")
+        }
+    }
+
+    // Real kernel quirk (hid-sony.c): some DS3-compatible boards (flagged
+    // SHANWAN_GAMEPAD in the driver) silently accept the SET_REPORT control
+    // transfer for output reports but never actually act on it - they need
+    // the report sent to the device's own interrupt OUT endpoint instead.
+    // The DS3's descriptor exposes one (endpoint 0x02, per the HID Report
+    // Descriptor fetched from eleccelerator.com/wiki DualShock_3). Sending
+    // both is harmless (redundant duplicate command at worst) and covers
+    // whichever path this specific board actually honors.
+    private fun findOutputEndpoint(intf: UsbInterface): UsbEndpoint? {
+        for (i in 0 until intf.endpointCount) {
+            val ep = intf.getEndpoint(i)
+            if (ep.direction == UsbConstants.USB_DIR_OUT) return ep
+        }
+        return null
+    }
+
+    private fun sendOutputReport(state: DeviceState, report: ByteArray) {
+        state.connection.claimInterface(state.intf, true)
+        val ctrlResult = state.connection.controlTransfer(0x21, 0x09, 0x0201, state.intf.id, report, report.size, 2000)
+        val ep = findOutputEndpoint(state.intf)
+        val bulkResult = ep?.let { state.connection.bulkTransfer(it, report, report.size, 2000) }
+        state.connection.releaseInterface(state.intf)
+        Log.d("Ds3Charger", "sendOutputReport: ctrl=$ctrlResult ep=${ep?.address} bulk=$bulkResult bytes=${report.take(6)}")
     }
 
     private fun analyzeAuthCheck(samples: Map<Int, List<Int>>): AuthCheckResult {
@@ -620,8 +751,35 @@ class Ds3ChargerService : Service() {
         return (usbText + btText).joinToString("\n\n")
     }
 
+    private fun buildDeviceCards(): List<DeviceCardInfo> {
+        val snapshot = synchronized(devices) { devices.values.toList() }
+        val btSnapshot = synchronized(btDevices) { btDevices.values.toList() }
+        val time = timeFmt.format(java.util.Date())
+        val usbCards = snapshot.map { s ->
+            val lines = s.infoLine.split("\n")
+            DeviceCardInfo(
+                deviceId = s.deviceId,
+                title = lines.getOrElse(0) { "Sony PLAYSTATION(R)3 Controller" }.removePrefix("Device: "),
+                detail = (lines.getOrElse(1) { "" } + "  (USB)").trim(),
+                batteryLine = "[$time] Battery: ${s.lastBatteryPct}%  (${s.lastStatus})",
+                authLine = s.authCheckResult?.let { "${it.verdict}\n${it.detail}" },
+            )
+        }
+        val btCards = btSnapshot.map { s ->
+            DeviceCardInfo(
+                deviceId = null,
+                title = s.name,
+                detail = "(Bluetooth / wireless)",
+                batteryLine = "[$time] Battery: ${s.lastBatteryPct}%  (wireless - not charging)",
+                authLine = null,
+            )
+        }
+        return usbCards + btCards
+    }
+
     private fun refreshUi() {
         listener?.onStatusUpdate(buildStatusText())
+        listener?.onDevicesUpdate(buildDeviceCards())
         updateNotification()
     }
 

@@ -2,15 +2,20 @@ package com.ds3charger.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
@@ -20,14 +25,26 @@ import android.widget.TextView
  * bound-service Listener callback, and requests notification permission on
  * API 33+ (needed for the service's persistent battery-% notification to
  * actually show).
+ *
+ * Each connected controller renders as its own card (title/detail/battery/
+ * auth result), built dynamically since the controller count varies - no
+ * RecyclerView needed given counts are always small. Each USB card gets its
+ * own Check Authenticity / Test Rumble buttons so a multi-controller setup
+ * can drive them independently instead of one screen-wide action.
  */
 class MainActivity : Activity(), Ds3ChargerService.Listener {
 
     private lateinit var statusView: TextView
-    private lateinit var authCheckButton: Button
-    private lateinit var authCheckResultView: TextView
+    private lateinit var devicesContainer: LinearLayout
     private var service: Ds3ChargerService? = null
     private var bound = false
+
+    // Rebuilt fresh every onDevicesUpdate - lets onAuthCheckProgress/Done
+    // update just the one card's result text + re-enable just its button,
+    // without a full card rebuild (which would happen anyway on the next
+    // periodic refresh and pick up the persisted result then).
+    private val authLineViews = mutableMapOf<Int, TextView>()
+    private val checkButtons = mutableMapOf<Int, Button>()
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -43,20 +60,9 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         statusView = findViewById(R.id.statusText)
-        authCheckButton = findViewById(R.id.authCheckButton)
-        authCheckResultView = findViewById(R.id.authCheckResult)
+        devicesContainer = findViewById(R.id.devicesContainer)
         findViewById<Button>(R.id.settingsButton).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
-        }
-        authCheckButton.setOnClickListener {
-            val deviceId = service?.firstConnectedDeviceId()
-            if (deviceId == null) {
-                authCheckResultView.text = "No controller connected."
-                return@setOnClickListener
-            }
-            authCheckButton.isEnabled = false
-            authCheckResultView.text = "Move a stick or press a button gently - checking..."
-            service?.startAuthenticityCheck(deviceId)
         }
 
         requestNotificationPermissionIfNeeded()
@@ -79,18 +85,126 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
     }
 
     override fun onStatusUpdate(text: String) {
+        // Only meaningful as the "no controller connected" empty-state
+        // message now - onDevicesUpdate owns the connected-device display.
         runOnUiThread { statusView.text = text }
     }
 
-    override fun onAuthCheckProgress(secondsLeft: Int) {
-        runOnUiThread { authCheckResultView.text = "Checking... ${secondsLeft}s left - keep moving the stick/button" }
+    override fun onDevicesUpdate(cards: List<Ds3ChargerService.DeviceCardInfo>) {
+        runOnUiThread {
+            statusView.visibility = if (cards.isEmpty()) View.VISIBLE else View.GONE
+            devicesContainer.removeAllViews()
+            authLineViews.clear()
+            checkButtons.clear()
+            for (card in cards) devicesContainer.addView(buildCardView(card))
+        }
     }
 
-    override fun onAuthCheckDone(result: Ds3ChargerService.AuthCheckResult) {
+    override fun onAuthCheckProgress(deviceId: Int, secondsLeft: Int) {
         runOnUiThread {
-            authCheckButton.isEnabled = true
-            authCheckResultView.text = "${result.verdict}\n${result.detail}"
+            authLineViews[deviceId]?.text = "Checking... ${secondsLeft}s left - keep moving the stick/button"
         }
+    }
+
+    override fun onAuthCheckDone(deviceId: Int, result: Ds3ChargerService.AuthCheckResult) {
+        runOnUiThread {
+            authLineViews[deviceId]?.text = "${result.verdict}\n${result.detail}"
+            checkButtons[deviceId]?.isEnabled = true
+        }
+    }
+
+    private fun buildCardView(card: Ds3ChargerService.DeviceCardInfo): View {
+        val dp = resources.displayMetrics.density
+        val pad = (16 * dp).toInt()
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(0xFFE8E8E8.toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = (12 * dp).toInt() }
+        }
+        container.addView(TextView(this).apply {
+            text = card.title
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        container.addView(TextView(this).apply { text = card.detail; textSize = 14f })
+        container.addView(TextView(this).apply { text = card.batteryLine; textSize = 14f })
+
+        val authView = TextView(this).apply {
+            text = card.authLine ?: ""
+            textSize = 14f
+            setPadding(0, (8 * dp).toInt(), 0, 0)
+        }
+        container.addView(authView)
+
+        // Only USB devices can be checked/rumbled - Bluetooth-only entries
+        // (deviceId == null) have no UsbDeviceConnection for the service to
+        // act on, so they just show status, no action buttons.
+        val id = card.deviceId
+        if (id != null) {
+            authLineViews[id] = authView
+            val buttonRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, (8 * dp).toInt(), 0, 0)
+            }
+            val checkBtn = Button(this).apply {
+                text = "Check Authenticity"
+                setOnClickListener {
+                    isEnabled = false
+                    authView.text = "Move a stick or press a button gently - checking..."
+                    service?.startAuthenticityCheck(id)
+                }
+            }
+            checkButtons[id] = checkBtn
+            val rumbleBtn = Button(this).apply {
+                text = "Test Rumble"
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = (8 * dp).toInt() }
+                setOnClickListener { service?.testRumble(id) }
+            }
+            // Real DS3 pairing is USB-write-driven (see pairToHost's kdoc) -
+            // restores wireless use after a factory reset wipes the
+            // controller's stored master address. A normal app can't read
+            // its own device's real Bluetooth MAC on this Android version
+            // (privacy restriction since Android 6.0), so the target host's
+            // MAC is typed in each time rather than auto-detected or
+            // hardcoded - no device-specific address belongs in public
+            // source. Find yours via Settings, or on the host machine
+            // itself (e.g. `adb shell settings get secure bluetooth_address`
+            // on an Android host).
+            val pairBtn = Button(this).apply {
+                text = "Pair to Host..."
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = (8 * dp).toInt() }
+                setOnClickListener { promptForHostMacAndPair(id) }
+            }
+            buttonRow.addView(checkBtn)
+            buttonRow.addView(rumbleBtn)
+            buttonRow.addView(pairBtn)
+            container.addView(buttonRow)
+        }
+
+        return container
+    }
+
+    private fun promptForHostMacAndPair(deviceId: Int) {
+        val input = EditText(this).apply {
+            hint = "AA:BB:CC:DD:EE:FF"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Pair to host")
+            .setMessage("Enter the target host's Bluetooth MAC address.")
+            .setView(input)
+            .setPositiveButton("Pair") { _, _ ->
+                val mac = input.text.toString().trim()
+                if (mac.isNotEmpty()) service?.pairToHost(deviceId, mac)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     override fun onStop() {
