@@ -361,17 +361,34 @@ class Ds3ChargerService : Service() {
         val buf = ByteArray(17)
         val result = connection.controlTransfer(0xA1, 0x01, 0x03F2, intf.id, buf, buf.size, 5000)
 
+        if (result < 0) {
+            connection.releaseInterface(intf)
+            connection.close()
+            retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
+            return
+        }
+
+        // Step 2 of sixaxis_set_operational_usb() - GET_REPORT feature report
+        // 0xF5, 8-byte buffer. THIS APP WAS MISSING THIS ENTIRELY until now -
+        // only step 1 above was ever implemented. Kernel comment: "some
+        // compatible controllers... need another query plus a USB interrupt
+        // to get operational." Real-world consequence found 2026-08-13: a
+        // controller could read HID input reports fine (so the app showed a
+        // plausible battery status) while charging never actually engaged,
+        // because the controller was never fully brought into operational
+        // mode. Non-fatal if it fails (most controllers don't strictly need
+        // it) - logged, doesn't block the connection.
+        val buf2 = ByteArray(8)
+        val result2 = connection.controlTransfer(0xA1, 0x01, 0x03F5, intf.id, buf2, buf2.size, 5000)
+        if (result2 < 0) {
+            Log.w("Ds3Charger", "operational step 2 (0xF5) failed, result=$result2 - continuing anyway")
+        }
+
         // Release right away - holding it exclusively blocks any other
         // consumer (the game, the OS's own USB-HID path) for as long as
         // this service runs. Real regression found 2026-07-13 from an
         // earlier version of this app holding it continuously.
         connection.releaseInterface(intf)
-
-        if (result < 0) {
-            connection.close()
-            retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
-            return
-        }
         val name = try {
             "${device.manufacturerName ?: "Sony"} ${device.productName ?: "PLAYSTATION(R)3 Controller"}"
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
