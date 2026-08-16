@@ -454,8 +454,14 @@ class Ds3ChargerService : Service() {
         }
         state.consecutivePollFailures = 0
         val raw = buf[BATTERY_BYTE_OFFSET].toInt() and 0xFF
+        // Real hardware limit, not a parsing gap: while actively charging the DS3's own
+        // charge controller owns this byte and only ever reports "still charging" vs
+        // "full" - no live percentage is transmitted (confirmed against both the Linux
+        // hid-sony.c driver and DsHidMini's DS3_RAW_INPUT_REPORT struct). -1 marks "no
+        // real percentage available" so the UI can show "Charging..." honestly instead
+        // of a fake number, rather than reusing the unrelated Full=100 value.
         val (pct, status) = when {
-            raw >= 0xee -> 100 to (if (raw and 0x01 == 1) "Full" else "Charging")
+            raw >= 0xee -> (if (raw and 0x01 == 1) 100 else -1) to (if (raw and 0x01 == 1) "Full" else "Charging")
             else -> SIXAXIS_BATTERY_CAPACITY[minOf(raw, 5)] to "On battery (not charging)"
         }
         // Fire the charge-complete alert on the Charging->Full edge only -
@@ -762,6 +768,12 @@ class Ds3ChargerService : Service() {
         }
     }
 
+    // pct == -1 means "actively charging, hardware reports no real percentage" -
+    // show that honestly instead of a fake/stale number (see the comment at the
+    // battery-byte decode site for why this happens).
+    private fun formatBatteryLine(time: String, pct: Int, status: String): String =
+        if (pct == -1) "[$time] Charging..." else "[$time] Battery: $pct%  ($status)"
+
     private fun buildStatusText(): String {
         val snapshot = synchronized(devices) { devices.values.toList() }
         val btSnapshot = synchronized(btDevices) { btDevices.values.toList() }
@@ -770,7 +782,7 @@ class Ds3ChargerService : Service() {
         }
         val time = timeFmt.format(java.util.Date())
         val usbText = snapshot.map { s ->
-            "${s.infoLine}\n[$time] Battery: ${s.lastBatteryPct}%  (${s.lastStatus})"
+            "${s.infoLine}\n${formatBatteryLine(time, s.lastBatteryPct, s.lastStatus)}"
         }
         val btText = btSnapshot.map { s ->
             "${s.name} (Bluetooth)\n[$time] Battery: ${s.lastBatteryPct}%  (wireless - not charging)"
@@ -788,7 +800,7 @@ class Ds3ChargerService : Service() {
                 deviceId = s.deviceId,
                 title = lines.getOrElse(0) { "Sony PLAYSTATION(R)3 Controller" }.removePrefix("Device: "),
                 detail = (lines.getOrElse(1) { "" } + "  (USB)").trim(),
-                batteryLine = "[$time] Battery: ${s.lastBatteryPct}%  (${s.lastStatus})",
+                batteryLine = formatBatteryLine(time, s.lastBatteryPct, s.lastStatus),
                 authLine = s.authCheckResult?.let { "${it.verdict}\n${it.detail}" },
             )
         }
@@ -816,7 +828,7 @@ class Ds3ChargerService : Service() {
         val text = if (snapshot.isEmpty() && btSnapshot.isEmpty()) {
             "No controller connected"
         } else {
-            val usbParts = snapshot.map { "${it.lastBatteryPct}% ${it.lastStatus}" }
+            val usbParts = snapshot.map { if (it.lastBatteryPct == -1) it.lastStatus else "${it.lastBatteryPct}% ${it.lastStatus}" }
             val btParts = btSnapshot.map { "${it.lastBatteryPct}% wireless" }
             (usbParts + btParts).joinToString("  |  ")
         }
