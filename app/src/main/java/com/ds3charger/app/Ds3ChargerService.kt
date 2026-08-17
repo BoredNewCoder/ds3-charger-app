@@ -227,24 +227,61 @@ class Ds3ChargerService : Service() {
     private val binder = LocalBinder()
     override fun onBind(intent: Intent?): IBinder = binder
 
+    // Real bug found+fixed 2026-08-17: none of this service's raw USB control-transfer calls
+    // (pollBattery, runAuthenticityCheck, sendChargeCommandAttempt, testRumble, pairToHost)
+    // were wrapped in try/catch, all running on the same single bgHandler thread. An uncaught
+    // exception on a HandlerThread's Looper is fatal to the whole app process by default (no
+    // custom UncaughtExceptionHandler here) -- one bad controlTransfer on ANY single tracked
+    // controller could crash the entire app for every controller. Worse: even in a hypothetical
+    // world where the process survived, pollRunnable never reached its own postDelayed
+    // reschedule call if anything above it threw, so polling would silently stop forever for
+    // every controller, not just the one that failed. bgPost/bgPostDelayed below catch
+    // Throwable at every post site instead of letting anything propagate to the Looper.
+    private fun bgPost(block: () -> Unit) {
+        bgHandler.post { runCatching(block).onFailure { Log.e("Ds3Charger", "bg task failed: ${it.message}", it) } }
+    }
+    private fun bgPostDelayed(delayMs: Long, block: () -> Unit) {
+        bgHandler.postDelayed(
+            { runCatching(block).onFailure { Log.e("Ds3Charger", "bg task failed: ${it.message}", it) } },
+            delayMs,
+        )
+    }
+
     private val pollRunnable = object : Runnable {
         override fun run() {
-            // Copy under lock, then poll outside it - pollBattery's blocking
-            // controlTransfer calls shouldn't hold the map lock the whole time.
-            val snapshot = synchronized(devices) { devices.values.toList() }
-            snapshot.forEach { pollBattery(it) }
-            pollBluetoothControllers()
-            // Single refresh after the whole batch - pollBattery used to call
-            // this per-device, so N controllers meant N notify()/listener
-            // calls per tick instead of 1.
-            refreshUi()
-            // Read fresh from Prefs every tick (not cached) so a change
-            // made in SettingsActivity takes effect on the very next poll,
-            // no service restart/rebind needed.
-            val baseIntervalMs = Prefs.getPollIntervalMinutes(this@Ds3ChargerService) * 60 * 1000L
-            val anyCharging = snapshot.any { it.lastStatus == "Charging" }
-            val intervalMs = if (anyCharging) minOf(FAST_POLL_INTERVAL_MS, baseIntervalMs) else baseIntervalMs
-            bgHandler.postDelayed(this, intervalMs)
+            // Reschedule is in `finally` so a bug in any single step (a bad connection, a
+            // Bluetooth API quirk) can never permanently stop the poll loop for the rest of
+            // the app's lifetime -- see the class-level comment on bgPost/bgPostDelayed above.
+            var anyCharging = false
+            try {
+                // Copy under lock, then poll outside it - pollBattery's blocking
+                // controlTransfer calls shouldn't hold the map lock the whole time.
+                val snapshot = synchronized(devices) { devices.values.toList() }
+                // Per-device try/catch: one dead/racing connection shouldn't skip polling the
+                // rest of the batch this tick.
+                for (state in snapshot) {
+                    try {
+                        pollBattery(state)
+                    } catch (e: Throwable) {
+                        Log.e("Ds3Charger", "pollBattery failed for deviceId=${state.deviceId}: ${e.message}", e)
+                    }
+                }
+                anyCharging = snapshot.any { it.lastStatus == "Charging" }
+                pollBluetoothControllers()
+                // Single refresh after the whole batch - pollBattery used to call
+                // this per-device, so N controllers meant N notify()/listener
+                // calls per tick instead of 1.
+                refreshUi()
+            } catch (e: Throwable) {
+                Log.e("Ds3Charger", "pollRunnable tick failed: ${e.message}", e)
+            } finally {
+                // Read fresh from Prefs every tick (not cached) so a change
+                // made in SettingsActivity takes effect on the very next poll,
+                // no service restart/rebind needed.
+                val baseIntervalMs = Prefs.getPollIntervalMinutes(this@Ds3ChargerService) * 60 * 1000L
+                val intervalMs = if (anyCharging) minOf(FAST_POLL_INTERVAL_MS, baseIntervalMs) else baseIntervalMs
+                bgHandler.postDelayed(this, intervalMs)
+            }
         }
     }
 
@@ -342,7 +379,7 @@ class Ds3ChargerService : Service() {
         // Enqueue onto the dedicated USB thread - callers (usbReceiver,
         // onCreate's initial scan) run on the main thread and must not block
         // on the control transfer below.
-        bgHandler.post { sendChargeCommandAttempt(device, attempt = 1) }
+        bgPost { sendChargeCommandAttempt(device, attempt = 1) }
     }
 
     private fun sendChargeCommandAttempt(device: UsbDevice, attempt: Int) {
@@ -420,10 +457,9 @@ class Ds3ChargerService : Service() {
         }
         // Linear backoff (500ms, 1000ms, 1500ms...) - some hubs are slower
         // to finish enumerating than a flat delay accounts for.
-        bgHandler.postDelayed(
-            { sendChargeCommandAttempt(device, attempt + 1) },
-            CHARGE_COMMAND_RETRY_BASE_DELAY_MS * attempt
-        )
+        bgPostDelayed(CHARGE_COMMAND_RETRY_BASE_DELAY_MS * attempt) {
+            sendChargeCommandAttempt(device, attempt + 1)
+        }
     }
 
     private fun pollBattery(state: DeviceState) {
@@ -495,7 +531,7 @@ class Ds3ChargerService : Service() {
             mainHandler.post { listener?.onAuthCheckDone(deviceId, AuthCheckResult("Not connected", "Plug in the controller first.")) }
             return
         }
-        bgHandler.post { runAuthenticityCheck(deviceId, state) }
+        bgPost { runAuthenticityCheck(deviceId, state) }
     }
 
     // Blocks bgHandler for the check's duration (same thread pollBattery/
@@ -554,7 +590,7 @@ class Ds3ChargerService : Service() {
             Log.w("Ds3Charger", "testRumble: no tracked device for id=$deviceId")
             return
         }
-        bgHandler.post {
+        bgPost {
             val rightOnly = SIXAXIS_OUTPUT_DEFAULT.copyOf().apply { this[3] = 1 }
             val leftOnly = SIXAXIS_OUTPUT_DEFAULT.copyOf().apply { this[5] = RUMBLE_TEST_FORCE }
             for (i in 0 until RUMBLE_SEGMENTS) {
@@ -593,7 +629,7 @@ class Ds3ChargerService : Service() {
         msg[0] = 0x01
         msg[1] = 0x00
         for (i in 0..5) msg[2 + i] = macBytes[i]
-        bgHandler.post {
+        bgPost {
             state.connection.claimInterface(state.intf, true)
             val result = state.connection.controlTransfer(0x21, 0x09, 0x03f5, state.intf.id, msg, msg.size, 5000)
             state.connection.releaseInterface(state.intf)
