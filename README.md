@@ -43,6 +43,19 @@ The USB interface is claimed only for the duration of each individual transfer, 
 
 Whether the charge-complete alert actually pops on screen depends on your Android TV **launcher**, not this app — unlike phones, Android TV doesn't render heads-up notification banners at the system level, that's up to whichever launcher app is set as default. Stock FLauncher, for example, doesn't implement notification overlays at all (the notification is still posted correctly, it just never displays). If yours doesn't show it, either check your launcher for a "notification overlay" style setting, or switch to one that has it (e.g. [LTvLauncher](https://github.com/LeanBitLab/LtvLauncher)).
 
+## Reliability fix (v1.4.1)
+
+Every USB control-transfer call in this app (battery poll, authenticity check, charge
+command, rumble test, host pairing) runs on one shared background thread that the battery
+poll loop itself reschedules on. None of them were wrapped in a try/catch — an uncaught
+exception on that thread is fatal to the whole app process by Android's default behavior,
+and even in a hypothetical survived case the poll loop would never reach its own reschedule
+call, silently stopping battery polling forever for every tracked controller, not just a
+failing one. Fixed with safe wrappers at every background-thread post site and a guaranteed
+reschedule in a `finally` block, plus per-device isolation so one dead/racing connection
+can't skip polling the rest of a multi-controller batch. Live-tested against a real DS3
+across multiple poll cycles post-fix with no regression.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
