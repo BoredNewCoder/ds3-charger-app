@@ -73,18 +73,6 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
-
-        <!-- Optional: only needed for the analog L2/R2 trigger feature (Prefs.
-             isAnalogTriggersEnabled, default off). The app works fully without
-             Shizuku installed - see Ds3ChargerService.setupShizuku()'s graceful
-             fallback. Same provider setup as the sibling 8bitdo-xbox-bridge app. -->
-        <provider
-            android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="${applicationId}.shizuku"
-            android:multiprocess="false"
-            android:enabled="true"
-            android:exported="true"
-            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 
 </manifest>

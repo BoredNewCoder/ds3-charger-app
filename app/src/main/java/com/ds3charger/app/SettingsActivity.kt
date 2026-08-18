@@ -20,8 +20,6 @@ class SettingsActivity : Activity() {
     private lateinit var chargeAlertsStatus: TextView
     private lateinit var lowBatteryAlertsToggle: Button
     private lateinit var lowBatteryAlertsStatus: TextView
-    private lateinit var analogTriggersToggle: Button
-    private lateinit var analogTriggersStatus: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,8 +30,6 @@ class SettingsActivity : Activity() {
         chargeAlertsStatus = findViewById(R.id.chargeAlertsStatus)
         lowBatteryAlertsToggle = findViewById(R.id.lowBatteryAlertsToggle)
         lowBatteryAlertsStatus = findViewById(R.id.lowBatteryAlertsStatus)
-        analogTriggersToggle = findViewById(R.id.analogTriggersToggle)
-        analogTriggersStatus = findViewById(R.id.analogTriggersStatus)
 
         findViewById<Button>(R.id.interval1).setOnClickListener { setInterval(1) }
         findViewById<Button>(R.id.interval5).setOnClickListener { setInterval(5) }
@@ -45,10 +41,6 @@ class SettingsActivity : Activity() {
         }
         lowBatteryAlertsToggle.setOnClickListener {
             Prefs.setLowBatteryAlertsEnabled(this, !Prefs.isLowBatteryAlertsEnabled(this))
-            refreshUi()
-        }
-        analogTriggersToggle.setOnClickListener {
-            Prefs.setAnalogTriggersEnabled(this, !Prefs.isAnalogTriggersEnabled(this))
             refreshUi()
         }
         findViewById<Button>(R.id.backButton).setOnClickListener { finish() }
@@ -74,13 +66,6 @@ class SettingsActivity : Activity() {
         lowBatteryAlertsToggle.text = if (lowBattEnabled) "Turn off" else "Turn on"
         lowBatteryAlertsStatus.text = if (lowBattEnabled)
             "Currently: on - alerts when a controller (on battery) drops to 25%"
-        else
-            "Currently: off"
-
-        val triggersEnabled = Prefs.isAnalogTriggersEnabled(this)
-        analogTriggersToggle.text = if (triggersEnabled) "Turn off" else "Turn on"
-        analogTriggersStatus.text = if (triggersEnabled)
-            "Currently: on - L2/R2 pressure sent as real analog triggers (needs Shizuku granted)"
         else
             "Currently: off"
     }
