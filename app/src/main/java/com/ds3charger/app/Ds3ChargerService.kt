@@ -102,6 +102,37 @@ class Ds3ChargerService : Service() {
     // channel with the most movement is the coarse-ADC tell.
     private val AUTH_CHECK_COARSE_GAP = 8
 
+    // Second, independent authenticity signal: the genuine SIXAXIS/DualShock 3's raw USB HID
+    // Report Descriptor (standard GET_DESCRIPTOR, type 0x22, read-only - not the SET_REPORT
+    // writes elsewhere in this file). Byte-exact, sourced from a real USBPcap capture
+    // (docs.nefarius.at/research/SIXAXIS-native-HID-Report-Descriptor/, the firmware-native
+    // variant, not the alternate SIXAXIS.SYS driver reinterpretation also shown on that page),
+    // verified 148 bytes long. Unlike the reverted 0xF2 "MAC" (see 2026-08-13 project memory -
+    // that field is a rewritable Bluetooth pairing target, not a serial, so a genuine re-paired
+    // controller could legitimately fail it), a device's report descriptor is firmware-baked and
+    // not user-alterable by any known method - no false-positive-from-normal-use risk. VID/PID
+    // deliberately NOT used as a signal either: real ShanWan DS3 clones report the identical
+    // Sony VID/PID (054C:0268), so it would only add false confidence, not real information.
+    private val KNOWN_GENUINE_REPORT_DESCRIPTOR = byteArrayOf(
+        0x05, 0x01, 0x09, 0x04, 0xA1.toByte(), 0x01, 0xA1.toByte(), 0x02, 0x85.toByte(), 0x01, 0x75, 0x08,
+        0x95.toByte(), 0x01, 0x15, 0x00, 0x26, 0xFF.toByte(), 0x00, 0x81.toByte(), 0x03, 0x75, 0x01, 0x95.toByte(),
+        0x13, 0x15, 0x00, 0x25, 0x01, 0x35, 0x00, 0x45, 0x01, 0x05, 0x09, 0x19,
+        0x01, 0x29, 0x13, 0x81.toByte(), 0x02, 0x75, 0x01, 0x95.toByte(), 0x0D, 0x06, 0x00, 0xFF.toByte(),
+        0x81.toByte(), 0x03, 0x15, 0x00, 0x26, 0xFF.toByte(), 0x00, 0x05, 0x01, 0x09, 0x01, 0xA1.toByte(),
+        0x00, 0x75, 0x08, 0x95.toByte(), 0x04, 0x35, 0x00, 0x46, 0xFF.toByte(), 0x00, 0x09, 0x30,
+        0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x81.toByte(), 0x02, 0xC0.toByte(), 0x05, 0x01, 0x75,
+        0x08, 0x95.toByte(), 0x27, 0x09, 0x01, 0x81.toByte(), 0x02, 0x75, 0x08, 0x95.toByte(), 0x30, 0x09,
+        0x01, 0x91.toByte(), 0x02, 0x75, 0x08, 0x95.toByte(), 0x30, 0x09, 0x01, 0xB1.toByte(), 0x02, 0xC0.toByte(),
+        0xA1.toByte(), 0x02, 0x85.toByte(), 0x02, 0x75, 0x08, 0x95.toByte(), 0x30, 0x09, 0x01, 0xB1.toByte(), 0x02,
+        0xC0.toByte(), 0xA1.toByte(), 0x02, 0x85.toByte(), 0xEE.toByte(), 0x75, 0x08, 0x95.toByte(), 0x30, 0x09, 0x01, 0xB1.toByte(),
+        0x02, 0xC0.toByte(), 0xA1.toByte(), 0x02, 0x85.toByte(), 0xEF.toByte(), 0x75, 0x08, 0x95.toByte(), 0x30, 0x09, 0x01,
+        0xB1.toByte(), 0x02, 0xC0.toByte(), 0xC0.toByte(),
+    )
+    private val HID_GET_DESCRIPTOR_BM_REQUEST_TYPE = 0x81  // IN, standard, interface
+    private val HID_GET_DESCRIPTOR_B_REQUEST = 0x06  // GET_DESCRIPTOR
+    private val HID_REPORT_DESCRIPTOR_W_VALUE = 0x2200  // type 0x22 (Report) << 8 | index 0
+    private val HID_DESCRIPTOR_READ_BUFFER_SIZE = 256  // generous - actual length comes from the transfer's real return value, not this
+
     // Rumble test. Real Linux kernel struct (drivers/hid/hid-sony.c,
     // sixaxis_send_output_report + struct sixaxis_rumble/sixaxis_output_report):
     // 36-byte OUTPUT report, ID 0x01, sent via SET_REPORT (bmRequestType 0x21,
@@ -579,12 +610,69 @@ class Ds3ChargerService : Service() {
             Thread.sleep(AUTH_CHECK_SAMPLE_INTERVAL_MS)
         }
 
-        val result = analyzeAuthCheck(samples)
+        val adcResult = analyzeAuthCheck(samples)
+        val descriptorStatus = readReportDescriptorStatus(state)
+        val result = combineAuthResults(adcResult, descriptorStatus)
         // Persisted on the DeviceState so it survives an Activity
         // rebind/reopen without re-running the check - buildDeviceCards()
         // reads it back into authLine every refresh.
         state.authCheckResult = result
         mainHandler.post { listener?.onAuthCheckDone(deviceId, result) }
+    }
+
+    // Single read-only GET_DESCRIPTOR control transfer (not part of the ADC sampling loop
+    // above - this doesn't need repeated samples, the descriptor doesn't change).
+    // Returns null if the read fails or the length is implausible (0 bytes, or way over the
+    // genuine 148) - treated as "unavailable", never as a clone verdict, so a controller that
+    // doesn't answer this cleanly (or a transient USB hiccup) can't produce a false "fake"
+    // result the way the reverted MAC check once did.
+    private fun readReportDescriptorStatus(state: DeviceState): Pair<String, String>? {
+        return try {
+            state.connection.claimInterface(state.intf, true)
+            val buf = ByteArray(HID_DESCRIPTOR_READ_BUFFER_SIZE)
+            val result = state.connection.controlTransfer(
+                HID_GET_DESCRIPTOR_BM_REQUEST_TYPE, HID_GET_DESCRIPTOR_B_REQUEST,
+                HID_REPORT_DESCRIPTOR_W_VALUE, state.intf.id, buf, buf.size, 2000
+            )
+            state.connection.releaseInterface(state.intf)
+            if (result <= 0 || result > HID_DESCRIPTOR_READ_BUFFER_SIZE) return null
+            val actual = buf.copyOf(result)
+            if (actual.contentEquals(KNOWN_GENUINE_REPORT_DESCRIPTOR)) {
+                "genuine" to "Report descriptor: byte-exact match to genuine Sony SIXAXIS/DS3 (148 bytes)."
+            } else {
+                "differs" to "Report descriptor: differs from genuine Sony (${result} bytes vs expected 148, or content mismatch) - possible clone or unusual firmware."
+            }
+        } catch (e: Exception) {
+            Log.w("Ds3Charger", "readReportDescriptorStatus failed: ${e.message}")
+            null
+        }
+    }
+
+    // Combines the ADC-quantization verdict (stick/button smoothness, from analyzeAuthCheck)
+    // with the report-descriptor verdict (readReportDescriptorStatus) into one result. Two
+    // independent signals agreeing is stronger evidence than either alone; disagreeing is
+    // reported honestly as inconclusive rather than picking a winner - same "don't overclaim"
+    // discipline as the rest of this app's authenticity-check history.
+    private fun combineAuthResults(adc: AuthCheckResult, descriptor: Pair<String, String>?): AuthCheckResult {
+        if (descriptor == null) return adc  // unavailable - fall back to ADC-only, current behavior
+        val (descStatus, descDetail) = descriptor
+        val adcGenuine = adc.verdict.startsWith("Smooth response")
+        val adcClone = adc.verdict.startsWith("Stepped response")
+
+        if (!adcGenuine && !adcClone) {
+            // ADC was inconclusive (not enough movement) - report the descriptor result on
+            // its own rather than trying to combine with a non-verdict.
+            val label = if (descStatus == "genuine") "Genuine (report descriptor)" else "Differs from genuine (report descriptor)"
+            return AuthCheckResult(label, "$descDetail\n(ADC check inconclusive this run - not enough movement, try again for a second signal.)")
+        }
+
+        val descGenuine = descStatus == "genuine"
+        return if (adcGenuine == descGenuine) {
+            val label = if (adcGenuine) "Genuine (2/2 signals agree)" else "Likely clone (2/2 signals agree)"
+            AuthCheckResult(label, "${adc.detail}\n$descDetail")
+        } else {
+            AuthCheckResult("Mixed signals - inconclusive", "ADC check: ${adc.verdict} - ${adc.detail}\n$descDetail")
+        }
     }
 
     // Continuous 1s rumble, motors alternating (each output report is a full
