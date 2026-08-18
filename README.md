@@ -34,6 +34,23 @@ The USB interface is claimed only for the duration of each individual transfer, 
 
 ## What this app deliberately does NOT do
 
+- **Test Rumble is real but weak — never got a clean, confirmed "it works."** The raw 36-byte
+  OUTPUT report is sent correctly (byte offsets verified against the kernel source and
+  cross-checked against DsHidMini), but across several tuning attempts (max force, pulsed
+  pattern, continuous 1s pattern, verified the byte-direction wasn't inverted against the
+  kernel's own FF-effect translation) the user only ever reported "barely felt it," held in
+  hand. Never resolved to a clean pass/fail — could be this specific controller's aged motors,
+  could be something Shield-USB-specific, not settled. **2026-08-17 cross-test**: separately
+  confirmed the DS3 also gets zero rumble through RetroArch directly (Crash Bash, a
+  rumble-heavy PS1 title) — checked both logcat and a raw kernel `getevent` capture on the
+  controller's own device node, zero `EV_FF` events reached it on real, repeated bumps. Android
+  never even classifies this controller's real `hid-sony`-driven input device with the
+  `VIBRATOR` device-class flag on this Shield (confirmed via `dumpsys input`: `0x80000141`, no
+  `0x200` bit) — so this isn't a bug specific to this app's raw-USB approach or to RetroArch;
+  it looks like a platform-level gap on this Android version. See
+  [`Raphnet_GC-N64_Controller_Bridge`](../Raphnet_GC-N64_Controller_Bridge/README.md) for the
+  fuller writeup of the same underlying limitation, hit independently via a completely
+  different controller/adapter.
 - **A full-charge LED indicator was tried and removed.** Lighting all 4 LEDs when the battery hits Full worked at the USB protocol level (confirmed via a real interrupt-endpoint output-report write), but Android itself assigns a connected DS3 a real gamepad "player slot" (`ControllerNumber` in `dumpsys input`) and re-asserts its own single player-indicator LED on the same report — even a few-times-a-second re-write from this app couldn't hold a steady all-4 state against it. The notification's `100% Full` text is the actual full-charge indicator now.
 - **Android TV does not auto-pair a DS3 the way a real PS3 does — correcting an earlier, wrong assumption in this README.** A previous version of this doc claimed Android's `hid-sony` kernel driver automatically writes the host's Bluetooth address into a plugged-in controller (the same mechanism real PS3s and PC pairing tools use, Feature report `0xF5`). That's not actually true on Android TV: `hid-sony` is a *Linux desktop/server* kernel driver, and there's no evidence Android's own Bluetooth/USB HID stack performs that write on plug-in. Live testing (2026-08-13) confirmed a DS3 does **not** wirelessly reconnect to a Shield on its own after its stored pairing address is reset, even after a correct USB re-pair write and a fresh Bluetooth bond attempt — the controller's own firmware terminated the connection every time (`reason:19`, remote-terminated), suggesting a real, unresolved Bluetooth-stack compatibility gap between the DS3's ~2006-era pairing protocol and at least this Shield's Android Bluetooth stack. The **Pair to Host...** button (new in v1.3.0) at least gets the correct address written into the controller — same mechanism a real PS3 uses — but full wireless reconnection to an Android TV device is not guaranteed to complete even so, and isn't something further changes to this app's USB code are likely to fix. If wireless use matters more than charging, a real PS3 (or a PC with a proper DS3 Bluetooth driver) remains the reliable way to pair one.
 
