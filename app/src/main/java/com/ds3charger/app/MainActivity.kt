@@ -67,7 +67,30 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
 
         requestNotificationPermissionIfNeeded()
 
-        val svcIntent = Intent(this, Ds3ChargerService::class.java)
+        // Real bug found+fixed 2026-08-17: when this app is the registered default handler
+        // for the DS3's device_filter (the normal case after first-time setup), Android
+        // delivers USB_DEVICE_ATTACHED by launching THIS activity directly with the device in
+        // the intent -- it does NOT also send a general broadcast that the service's own
+        // Context-registered usbReceiver would catch. Previously this intent's device extra
+        // was silently discarded (the service was just started/bound generically), so a
+        // controller plugged in while the app/service wasn't already tracking it -- e.g. a
+        // fully powered-off DS3, since it enumerates fresh on every plug -- never actually
+        // triggered the charge-command handshake at all. Confirmed live: MainActivity launched,
+        // zero Ds3Charger log lines, "No DualShock 3 connected" shown despite the controller
+        // being plugged in and USB permission already granted. Forwarding the device through
+        // to the service closes the gap.
+        @Suppress("DEPRECATION")
+        val attachedDevice: android.hardware.usb.UsbDevice? =
+            if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+                intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE)
+            } else null
+
+        val svcIntent = Intent(this, Ds3ChargerService::class.java).apply {
+            if (attachedDevice != null) {
+                action = android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED
+                putExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE, attachedDevice)
+            }
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(svcIntent)
         } else {

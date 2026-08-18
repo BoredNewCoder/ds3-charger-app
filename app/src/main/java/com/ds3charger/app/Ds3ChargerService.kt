@@ -351,7 +351,18 @@ class Ds3ChargerService : Service() {
         bgHandler.post(pollRunnable)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // See MainActivity's onCreate comment: Android launches the activity directly (not a
+        // broadcast) when this app is the registered default handler for the DS3's
+        // device_filter, so that's the only reliable place a live attach event's UsbDevice
+        // ever reaches this app -- forwarded here via the service intent's extra.
+        if (intent?.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            @Suppress("DEPRECATION")
+            val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+            device?.let { checkAndRequestDevice(it) }
+        }
+        return START_STICKY
+    }
 
     private fun checkAndRequestDevice(device: UsbDevice) {
         if (device.vendorId != SONY_VENDOR_ID || device.productId != DS3_PRODUCT_ID) return
