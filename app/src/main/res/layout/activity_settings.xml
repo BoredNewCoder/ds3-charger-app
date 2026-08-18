@@ -75,6 +75,26 @@
         android:layout_marginTop="8dp"
         android:textSize="16sp" />
 
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="22sp"
+        android:layout_marginTop="32dp"
+        android:text="Analog L2/R2 triggers (needs Shizuku)" />
+
+    <Button
+        android:id="@+id/analogTriggersToggle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp" />
+
+    <TextView
+        android:id="@+id/analogTriggersStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textSize="16sp" />
+
     <Button
         android:id="@+id/backButton"
         android:layout_width="wrap_content"

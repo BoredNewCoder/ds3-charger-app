@@ -5,8 +5,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.bluetooth.BluetoothManager
 import android.content.IntentFilter
 import android.hardware.input.InputManager
@@ -24,6 +27,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import rikka.shizuku.Shizuku
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -298,6 +302,18 @@ class Ds3ChargerService : Service() {
                     }
                 }
                 anyCharging = snapshot.any { it.lastStatus == "Charging" }
+                // Same "read fresh from Prefs every tick, no restart needed" convention as the
+                // poll interval below - lazily starts/stops trigger polling per device to match
+                // whatever the settings toggle currently says, without needing a service rebind.
+                val triggersWanted = Prefs.isAnalogTriggersEnabled(this@Ds3ChargerService)
+                for (state in snapshot) {
+                    val running = triggerPollFlags[state.deviceId] == true
+                    if (triggersWanted && !running) {
+                        if (injector != null) startTriggerPolling(state.deviceId) else setupShizuku()
+                    } else if (!triggersWanted && running) {
+                        stopTriggerPolling(state.deviceId)
+                    }
+                }
                 pollBluetoothControllers()
                 // Single refresh after the whole batch - pollBattery used to call
                 // this per-device, so N controllers meant N notify()/listener
@@ -342,6 +358,7 @@ class Ds3ChargerService : Service() {
                     @Suppress("DEPRECATION")
                     val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     device?.let {
+                        stopTriggerPolling(it.deviceId)
                         synchronized(devices) {
                             devices.remove(it.deviceId)?.connection?.close()
                             pendingDeviceIds.remove(it.deviceId)
@@ -351,6 +368,134 @@ class Ds3ChargerService : Service() {
                 }
             }
         }
+    }
+
+    // ---- Analog L2/R2 trigger injection (optional, needs Shizuku) ----
+    // See TriggerInjectorService/ds3_trigger_uinput.c for the real "why" (only /dev/uinput-
+    // capable UID on this device, same constraint the sibling 8bitdo-xbox-bridge project
+    // already solved this exact way). Entirely additive: with Shizuku not installed/granted,
+    // or the feature toggled off (Prefs.isAnalogTriggersEnabled, default false), everything
+    // else in this file behaves exactly as before - injector stays null and every call site
+    // below no-ops via the null check.
+    private var injector: ITriggerInjector? = null
+    private val SHIZUKU_PERMISSION_REQUEST_CODE = 5150
+
+    // Bump processNameSuffix's implicit version pin if TriggerInjectorService/native code
+    // changes shape later - Shizuku reuses a cached process across app updates otherwise
+    // (real lesson already hit once by the sibling GipBridge project, documented there).
+    // BuildConfig.APPLICATION_ID (compile-time constant), NOT this.packageName - a Service's
+    // Context isn't attached yet during class-level property initialization, so calling
+    // packageName here throws NPE at construction time (real bug hit live: "Attempt to invoke
+    // virtual method getPackageName() on a null object reference" at Ds3ChargerService.<init>).
+    // Same fix the sibling GipBridge project already uses for this exact reason.
+    private val userServiceArgs = Shizuku.UserServiceArgs(
+        ComponentName(BuildConfig.APPLICATION_ID, TriggerInjectorService::class.java.name)
+    ).daemon(false).processNameSuffix("trigger").debuggable(false).version(1)
+
+    private val userServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            injector = ITriggerInjector.Stub.asInterface(binder)
+            Log.d("Ds3Charger", "Shizuku trigger-injector service connected.")
+            // Re-open every already-tracked device against the (possibly freshly
+            // respawned) injector process, same reasoning as the sibling GipBridge project.
+            synchronized(devices) {
+                for ((deviceId, _) in devices) {
+                    if (Prefs.isAnalogTriggersEnabled(this@Ds3ChargerService)) startTriggerPolling(deviceId)
+                }
+            }
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+            injector = null
+            Log.d("Ds3Charger", "Shizuku trigger-injector service disconnected.")
+        }
+    }
+
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+        if (grantResult == PackageManager.PERMISSION_GRANTED) {
+            Log.d("Ds3Charger", "Shizuku permission granted, binding trigger injector...")
+            bindInjector()
+        } else {
+            Log.w("Ds3Charger", "Shizuku permission DENIED - analog triggers unavailable, everything else unaffected.")
+        }
+    }
+
+    private fun bindInjector() {
+        runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
+        Shizuku.bindUserService(userServiceArgs, userServiceConnection)
+    }
+
+    // Called from onCreate below AND lazily whenever the settings toggle turns on (in case
+    // Shizuku's own binder wasn't alive yet at service startup - addBinderReceivedListenerSticky
+    // fires immediately if it's already available, or later once it becomes available, either
+    // way exactly once per real connection).
+    private fun setupShizuku() {
+        if (!Prefs.isAnalogTriggersEnabled(this)) return
+        if (runCatching { Shizuku.isPreV11() }.getOrDefault(true)) {
+            Log.w("Ds3Charger", "Shizuku pre-v11 or not running - analog triggers unavailable.")
+            return
+        }
+        when {
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> bindInjector()
+            Shizuku.shouldShowRequestPermissionRationale() ->
+                Log.w("Ds3Charger", "Shizuku permission previously denied by user.")
+            else -> Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+        }
+    }
+
+    // deviceId -> polling thread + its own run flag. Separate from the slow battery
+    // pollRunnable (15min default interval, far too slow for real-time trigger input) -
+    // this runs its own continuous ~20Hz loop per device, same rate the existing
+    // authenticity-check sampling loop already uses successfully in this file.
+    private val TRIGGER_POLL_INTERVAL_MS = 50L
+    private val triggerPollFlags = java.util.Collections.synchronizedMap(mutableMapOf<Int, Boolean>())
+    private val triggerPollThreads = java.util.Collections.synchronizedMap(mutableMapOf<Int, Thread>())
+
+    private fun startTriggerPolling(deviceId: Int) {
+        val inj = injector ?: return
+        if (triggerPollFlags[deviceId] == true) return  // already running for this device
+        val state = devices[deviceId] ?: return
+        val name = "DualShock 3 Analog Trigger Pad"  // no "Virtual" substring - see native code's doc comment
+        val opened = runCatching { inj.openDevice(deviceId, name) }.getOrElse { false }
+        if (!opened) {
+            Log.w("Ds3Charger", "startTriggerPolling: openDevice failed for deviceId=$deviceId")
+            return
+        }
+        triggerPollFlags[deviceId] = true
+        val thread = Thread({
+            while (triggerPollFlags[deviceId] == true) {
+                val liveState = devices[deviceId]
+                if (liveState == null) break  // device gone, DETACHED handler will have called stopTriggerPolling too
+                try {
+                    liveState.connection.claimInterface(liveState.intf, true)
+                    val buf = ByteArray(INPUT_REPORT_SIZE)
+                    val result = liveState.connection.controlTransfer(
+                        0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, liveState.intf.id, buf, buf.size, 500
+                    )
+                    liveState.connection.releaseInterface(liveState.intf)
+                    // L2=offset 18, R2=offset 19 within AUTH_CHECK_PRESSURE_OFFSETS (14-25) -
+                    // same verified-correct offsets this file's own authenticity check already
+                    // uses (AUTH_CHECK_LABELS: 18 to "L2", 19 to "R2").
+                    if (result > 19) {
+                        val l2 = buf[18].toInt() and 0xFF
+                        val r2 = buf[19].toInt() and 0xFF
+                        runCatching { injector?.sendTriggers(deviceId, l2, r2) }
+                            .onFailure { Log.e("Ds3Charger", "sendTriggers failed for deviceId=$deviceId: ${it.message}") }
+                    }
+                } catch (e: Exception) {
+                    Log.e("Ds3Charger", "trigger poll failed for deviceId=$deviceId: ${e.message}")
+                }
+                Thread.sleep(TRIGGER_POLL_INTERVAL_MS)
+            }
+        }, "Ds3TriggerPoll-$deviceId")
+        triggerPollThreads[deviceId] = thread
+        thread.start()
+        Log.d("Ds3Charger", "trigger polling started for deviceId=$deviceId")
+    }
+
+    private fun stopTriggerPolling(deviceId: Int) {
+        triggerPollFlags[deviceId] = false
+        triggerPollThreads.remove(deviceId)?.interrupt()
+        runCatching { injector?.closeDevice(deviceId) }
     }
 
     override fun onCreate() {
@@ -380,6 +525,11 @@ class Ds3ChargerService : Service() {
             .forEach { checkAndRequestDevice(it) }
 
         bgHandler.post(pollRunnable)
+
+        runCatching {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+            Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
+        }.onFailure { Log.w("Ds3Charger", "Shizuku listener setup failed (Shizuku app likely not installed): ${it.message}") }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -491,6 +641,9 @@ class Ds3ChargerService : Service() {
             devices[device.deviceId] = DeviceState(connection, intf, infoLine, device.deviceId)
             pendingDeviceIds.remove(reservationId)
         }
+        if (Prefs.isAnalogTriggersEnabled(this)) {
+            if (injector != null) startTriggerPolling(device.deviceId) else setupShizuku()
+        }
         refreshUi()
     }
 
@@ -561,6 +714,7 @@ class Ds3ChargerService : Service() {
                 // Connection's dead (device gone but DETACHED hasn't/won't
                 // fire, e.g. a hub power fault) - stop holding the claim on
                 // it forever, let a future re-plug get a clean attempt.
+                stopTriggerPolling(state.deviceId)
                 synchronized(devices) {
                     devices.remove(state.deviceId)
                     pendingDeviceIds.remove(state.deviceId)
@@ -1066,6 +1220,12 @@ class Ds3ChargerService : Service() {
         super.onDestroy()
         bgHandler.removeCallbacksAndMessages(null)
         bgThread.quitSafely()
+        synchronized(triggerPollFlags) {
+            for (deviceId in triggerPollFlags.keys.toList()) stopTriggerPolling(deviceId)
+        }
+        runCatching { injector?.destroy() }
+        runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
+        runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
         synchronized(devices) {
             devices.values.forEach { it.connection.close() }
             devices.clear()

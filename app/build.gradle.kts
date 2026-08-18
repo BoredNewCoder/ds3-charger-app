@@ -19,10 +19,36 @@ android {
 
     defaultConfig {
         applicationId = "com.ds3charger.app"
-        minSdk = 21
+        // Bumped from 21 to 24 - dev.rikka.shizuku:api/provider (needed for the optional
+        // analog trigger feature) declare minSdk 23/24 in their own manifests, and the
+        // manifest merger fails otherwise. Safe in practice: every real device this app
+        // targets (Shield TV Pro runs Android 11) is well above this floor.
+        minSdk = 24
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        // Shield TV Pro is arm64 - no need to ship other ABIs (matches the
+        // sibling 8bitdo-xbox-bridge project's real uinput setup, same reasoning).
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += ""
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    buildFeatures {
+        aidl = true
+        buildConfig = true
     }
 
     signingConfigs {
@@ -58,4 +84,12 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
+    // Analog L2/R2 trigger injection needs /dev/uinput write access, which only the ADB
+    // shell UID has on this device (confirmed live in the sibling 8bitdo-xbox-bridge
+    // project) - Shizuku is how a normal app process gets a shell-UID service without
+    // requiring root. Optional at runtime: the app works fully without Shizuku installed,
+    // just without this one feature (see Prefs.isAnalogTriggersEnabled + the graceful
+    // fallback in Ds3ChargerService's setupShizuku()).
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }
