@@ -758,19 +758,32 @@ class Ds3ChargerService : Service() {
         nm.notify(notifId, notif)
     }
 
-    // Skips entirely while any USB-connected controller is tracked - that
-    // path already gives richer, faster, real-time battery data for the
-    // common single-controller case, so there's no need to double-track
-    // the same physical unit over two different code paths. A controller
-    // that's genuinely wireless-only (never plugged in this session) is
-    // unaffected by this check.
+    // Real fix (2026-08-17): used to skip Bluetooth polling ENTIRELY whenever any USB
+    // controller was tracked, on the assumption there'd only ever be one physical DS3 in
+    // play. That's wrong for a real multi-controller setup: one DS3 wired + a second,
+    // genuinely different DS3 connected wirelessly at the same time would mean the wireless
+    // one's battery never got tracked at all. There's no cheap way to prove two same-model
+    // DS3s across different transports are/aren't the same physical unit from this app's
+    // available APIs (no shared MAC/serial readable from both the USB and Bluetooth-input
+    // paths), so this can't be made perfect -- but it can be made strictly better: only
+    // suppress as many Bluetooth DS3 entries as there are wired ones (covering the real,
+    // already-fixed case of a wired controller's own Bluetooth ghost-reconnect), and track
+    // anything beyond that count as a real second controller. Stable ordering (sorted by
+    // descriptor) so which specific entry gets suppressed doesn't flap between polls.
     private fun pollBluetoothControllers() {
-        if (devices.isNotEmpty()) return
+        val usbCount = devices.size
         val im = getSystemService(Context.INPUT_SERVICE) as InputManager
-        val seen = mutableSetOf<String>()
+        val ds3BtDevices = mutableListOf<android.view.InputDevice>()
         for (id in im.inputDeviceIds) {
             val dev = im.getInputDevice(id) ?: continue
-            if (dev.vendorId != SONY_VENDOR_ID || dev.productId != DS3_PRODUCT_ID) continue
+            if (dev.vendorId == SONY_VENDOR_ID && dev.productId == DS3_PRODUCT_ID) ds3BtDevices.add(dev)
+        }
+        ds3BtDevices.sortBy { it.descriptor }
+        val trackedNow: List<android.view.InputDevice> =
+            if (usbCount >= ds3BtDevices.size) emptyList() else ds3BtDevices.drop(usbCount)
+
+        val seen = mutableSetOf<String>()
+        for (dev in trackedNow) {
             seen.add(dev.descriptor)
             val pct = readBluetoothBatteryPct(dev) ?: continue
             val state = btDevices.getOrPut(dev.descriptor) { BtDeviceState(dev.descriptor, dev.name) }
