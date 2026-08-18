@@ -73,6 +73,31 @@ reschedule in a `finally` block, plus per-device isolation so one dead/racing co
 can't skip polling the rest of a multi-controller batch. Live-tested against a real DS3
 across multiple poll cycles post-fix with no regression.
 
+## Charging fix for a controller plugged in while off (v1.4.2)
+
+A DS3 plugged in while fully powered off (no LEDs, no PS button press) could enumerate on
+USB but never actually start charging — confirmed live via a completely silent app log
+(zero charge-command activity at all) despite a real attach event firing and USB permission
+already being granted.
+
+**Real cause**: once this app is set as the default handler for the DS3's USB device filter
+(the normal state after first accepting the "Open with GIP Bridge"-style dialog), Android
+delivers the attach event by launching `MainActivity` directly with the device attached to
+the intent — it does **not** also send a general broadcast, so this app's own
+service-registered USB receiver never saw a live attach event through that path at all.
+`MainActivity` was discarding that intent's device info entirely instead of forwarding it
+anywhere, so a controller plugged in while the service wasn't already tracking it — any
+fresh attach, whether the controller was on or off — never triggered the charge-command
+handshake. Earlier verified-working tests happened to coincide with a fresh service start
+(which does its own one-time device scan), which is why this went unnoticed until a
+controller was plugged in mid-session instead.
+
+**Fixed**: `MainActivity` now forwards the real device through to the service on a live
+attach, reusing all the already-correct connection/retry logic — no new charging logic
+needed, just making sure the device info actually reaches it. Live-confirmed: the real
+operational-mode handshake (`0xF5` step) now completes within ~1 second of plugging in a
+powered-off DS3, and the app shows `Charging...` within seconds.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
