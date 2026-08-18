@@ -421,21 +421,27 @@ class Ds3ChargerService : Service() {
         // Enqueue onto the dedicated USB thread - callers (usbReceiver,
         // onCreate's initial scan) run on the main thread and must not block
         // on the control transfer below.
-        bgPost { sendChargeCommandAttempt(device, attempt = 1) }
+        bgPost { sendChargeCommandAttempt(device, attempt = 1, reservationId = device.deviceId) }
     }
 
-    private fun sendChargeCommandAttempt(device: UsbDevice, attempt: Int) {
+    // reservationId is the deviceId checkAndRequestDevice originally reserved in
+    // pendingDeviceIds - kept separate from `device.deviceId` because a retry may pass
+    // in a freshly re-resolved UsbDevice (see retryChargeCommand) whose own deviceId can
+    // differ from the original if the kernel re-enumerated the physical device under a
+    // new bus path in between attempts. Always clear the RESERVATION id, not whatever
+    // the current device object happens to report.
+    private fun sendChargeCommandAttempt(device: UsbDevice, attempt: Int, reservationId: Int) {
         if (devices.containsKey(device.deviceId)) return  // already tracked by an earlier attempt
 
         val connection: UsbDeviceConnection? = usbManager.openDevice(device)
         if (connection == null) {
-            retryChargeCommand(device, attempt, "openDevice failed")
+            retryChargeCommand(device, attempt, reservationId, "openDevice failed")
             return
         }
         val intf = device.getInterface(0)
         if (!connection.claimInterface(intf, true)) {
             connection.close()
-            retryChargeCommand(device, attempt, "claimInterface failed")
+            retryChargeCommand(device, attempt, reservationId, "claimInterface failed")
             return
         }
 
@@ -449,7 +455,7 @@ class Ds3ChargerService : Service() {
         if (result < 0) {
             connection.releaseInterface(intf)
             connection.close()
-            retryChargeCommand(device, attempt, "controlTransfer failed (result=$result)")
+            retryChargeCommand(device, attempt, reservationId, "controlTransfer failed (result=$result)")
             return
         }
 
@@ -483,7 +489,7 @@ class Ds3ChargerService : Service() {
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
         synchronized(devices) {
             devices[device.deviceId] = DeviceState(connection, intf, infoLine, device.deviceId)
-            pendingDeviceIds.remove(device.deviceId)
+            pendingDeviceIds.remove(reservationId)
         }
         refreshUi()
     }
@@ -492,16 +498,51 @@ class Ds3ChargerService : Service() {
     // busy right after plug-in, etc) used to permanently drop the device
     // until physical replug - USB_DEVICE_ATTACHED only fires once per plug
     // event. Retry a few times with a short delay before giving up.
-    private fun retryChargeCommand(device: UsbDevice, attempt: Int, reason: String) {
+    //
+    // Real bug found+fixed 2026-08-18 (live logcat, not guessed): this used to reuse the
+    // SAME UsbDevice object on every retry - captured once, back at the original
+    // ACTION_USB_DEVICE_ATTACHED event. Confirmed live: usbManager.openDevice() throws
+    // `IllegalArgumentException: device /dev/bus/usb/NNN/MMM does not exist or is
+    // restricted` on every single retry when the kernel has re-enumerated the physical
+    // device under a different bus path in between attempts (observed correlating with
+    // com.nvidia.bluetooth.ps3usbpairer, an NVIDIA Shield system app, also
+    // claiming+releasing the same USB interface on every attach - real contributing
+    // churn, not just theoretical). A stale UsbDevice's internal path reference never
+    // becomes valid again, so every retry using it was guaranteed to fail identically no
+    // matter how many attempts were budgeted - explains why some attaches worked (no
+    // unlucky re-enumeration that time) and others silently died every time. Fixed by
+    // re-resolving the CURRENT live UsbDevice from usbManager.deviceList on every retry
+    // instead of trusting the captured reference.
+    private fun retryChargeCommand(device: UsbDevice, attempt: Int, reservationId: Int, reason: String) {
         if (attempt >= MAX_CHARGE_COMMAND_ATTEMPTS) {
-            synchronized(devices) { pendingDeviceIds.remove(device.deviceId) }
+            Log.w("Ds3Charger", "charge attempt $attempt/$MAX_CHARGE_COMMAND_ATTEMPTS (reservationId=$reservationId) failed: $reason - giving up")
+            synchronized(devices) { pendingDeviceIds.remove(reservationId) }
             return
         }
+        Log.w("Ds3Charger", "charge attempt $attempt/$MAX_CHARGE_COMMAND_ATTEMPTS (reservationId=$reservationId) failed: $reason - retrying")
         // Linear backoff (500ms, 1000ms, 1500ms...) - some hubs are slower
         // to finish enumerating than a flat delay accounts for.
         bgPostDelayed(CHARGE_COMMAND_RETRY_BASE_DELAY_MS * attempt) {
-            sendChargeCommandAttempt(device, attempt + 1)
+            val fresh = resolveCurrentDevice(device.deviceId, device.vendorId, device.productId)
+            if (fresh == null) {
+                Log.w("Ds3Charger", "charge retry (reservationId=$reservationId): device no longer present, giving up")
+                synchronized(devices) { pendingDeviceIds.remove(reservationId) }
+                return@bgPostDelayed
+            }
+            sendChargeCommandAttempt(fresh, attempt + 1, reservationId)
         }
+    }
+
+    // Re-resolves a live UsbDevice from the CURRENT device list rather than trusting a
+    // UsbDevice object captured at some earlier point in time - see retryChargeCommand's
+    // comment for why a stale reference guarantees repeated openDevice() failures. Tries
+    // the original deviceId first (the common case, id stable across the retry), falls
+    // back to a VID/PID match (covers real re-enumeration where the id itself changed).
+    // Returns null only when the physical device is genuinely gone.
+    private fun resolveCurrentDevice(originalDeviceId: Int, vendorId: Int, productId: Int): UsbDevice? {
+        val current = usbManager.deviceList.values
+        return current.firstOrNull { it.deviceId == originalDeviceId }
+            ?: current.firstOrNull { it.vendorId == vendorId && it.productId == productId }
     }
 
     private fun pollBattery(state: DeviceState) {
