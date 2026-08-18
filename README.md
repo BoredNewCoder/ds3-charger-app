@@ -135,6 +135,28 @@ ghost-reconnect case above), and track anything beyond that count as a real seco
 against the existing single-controller/no-controller path (real controller still shows and polls
 correctly). Not live-tested against an actual second DS3 — none was available at fix time.
 
+## Charge-retry stale-device fix (v1.4.4)
+
+A DS3 could plug in, fire the attach event, and then silently and permanently fail to
+charge — confirmed live via logcat showing `UsbManager.openDevice()` throwing
+`IllegalArgumentException: device /dev/bus/usb/001/003 does not exist or is restricted`
+on every one of the charge-command's automatic retry attempts.
+
+**Real cause**: the retry path reused the same `UsbDevice` object captured at the original
+attach event across every retry. If the kernel re-enumerated the controller under a
+different bus path in the meantime — real, observed churn correlated with an NVIDIA system
+app (`com.nvidia.bluetooth.ps3usbpairer`) that also claims and releases the same USB
+interface on every attach — that stale object's path reference goes invalid, and every
+retry fails identically no matter how many are attempted. This is also why charging
+sometimes "just took a while" instead of failing outright: whether that re-enumeration race
+actually happened on a given plug-in was down to timing luck.
+
+**Fixed**: each retry now re-resolves the *current* `UsbDevice` from `UsbManager`'s live
+device list (matching on device ID, falling back to vendor/product ID if the ID itself
+changed) instead of trusting the original reference. Also added logging to every retry and
+give-up path in this chain, which was completely silent before — a real diagnosis gap in
+its own right.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
