@@ -60,6 +60,23 @@ The USB interface is claimed only for the duration of each individual transfer, 
 
 Whether the charge-complete alert actually pops on screen depends on your Android TV **launcher**, not this app — unlike phones, Android TV doesn't render heads-up notification banners at the system level, that's up to whichever launcher app is set as default. Stock FLauncher, for example, doesn't implement notification overlays at all (the notification is still posted correctly, it just never displays). If yours doesn't show it, either check your launcher for a "notification overlay" style setting, or switch to one that has it (e.g. [LTvLauncher](https://github.com/LeanBitLab/LtvLauncher)).
 
+## A note on RetroArch showing a duplicate DS3 controller (not a bug in this app)
+
+If a DS3 is both wired (charging) and still paired to the Shield over Bluetooth, the controller
+will automatically try reconnecting over Bluetooth the instant its wired connection drops (or
+even just glitches) — Android's Bluetooth HID stack visibly chokes on the resulting duplicate
+(`bta_hh_co_open: Found an existing device with the same handle`, `already added`, `unexpected
+transition` in logcat). The real user-facing symptom: **RetroArch shows two
+"PLAYSTATION(R)3 Controller" entries**, and stops responding to input, because RetroArch tracks
+controller port bindings by live ordinal position, not stable device ID — the flapping duplicate
+shuffles which port everything's bound to, not just its own.
+
+This isn't something this app (or RetroArch) can fix from software — it's the DS3's own firmware
+aggressively retrying its stored Bluetooth pairing. If you mainly use a DS3 wired, the real fix
+is to forget/unpair it from the Shield's Bluetooth settings entirely (Settings → Remotes &
+Accessories). With no stored bond, the controller has nothing to reconnect to. Wired charging and
+use are unaffected — this only costs wireless use, which you can re-pair later if you ever want it.
+
 ## Reliability fix (v1.4.1)
 
 Every USB control-transfer call in this app (battery poll, authenticity check, charge
@@ -97,6 +114,25 @@ attach, reusing all the already-correct connection/retry logic — no new chargi
 needed, just making sure the device info actually reaches it. Live-confirmed: the real
 operational-mode handshake (`0xF5` step) now completes within ~1 second of plugging in a
 powered-off DS3, and the app shows `Charging...` within seconds.
+
+## Multi-controller Bluetooth fix (v1.4.4)
+
+`pollBluetoothControllers()` used to skip Bluetooth battery tracking **entirely** whenever any
+USB controller was tracked — a reasonable-seeming assumption at the time (avoid double-tracking
+the same physical unit across two code paths), but wrong for a genuine multi-controller setup:
+one DS3 wired + a second, different DS3 connected wirelessly at the same time meant the wireless
+one's battery never got tracked at all, silently.
+
+**Real constraint, not papered over**: this app has no cheap way to prove two same-model DS3s
+across different transports are/aren't the same physical unit — there's no shared MAC/serial
+readable from both the USB and Bluetooth-input code paths at this app's level. Can't be made
+perfect. Made it strictly better instead: count-based suppression — only skip as many Bluetooth
+DS3 entries as there are wired ones (still correctly covers the real wired-controller-Bluetooth-
+ghost-reconnect case above), and track anything beyond that count as a real second controller.
+
+**Honestly scoped**: verified by code review, a clean build, and a confirmed no-regression check
+against the existing single-controller/no-controller path (real controller still shows and polls
+correctly). Not live-tested against an actual second DS3 — none was available at fix time.
 
 ## Requirements
 
