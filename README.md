@@ -73,7 +73,7 @@ reschedule in a `finally` block, plus per-device isolation so one dead/racing co
 can't skip polling the rest of a multi-controller batch. Live-tested against a real DS3
 across multiple poll cycles post-fix with no regression.
 
-## Charging fix for a controller plugged in while off (v1.4.2)
+## Charging fix for a controller plugged in while off (v1.4.3)
 
 A DS3 plugged in while fully powered off (no LEDs, no PS button press) could enumerate on
 USB but never actually start charging — confirmed live via a completely silent app log
