@@ -58,14 +58,6 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        statusView = findViewById(R.id.statusText)
-        devicesContainer = findViewById(R.id.devicesContainer)
-        findViewById<Button>(R.id.settingsButton).setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-        }
-
-        requestNotificationPermissionIfNeeded()
 
         // Real bug found+fixed 2026-08-17: when this app is the registered default handler
         // for the DS3's device_filter (the normal case after first-time setup), Android
@@ -96,6 +88,36 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
         } else {
             startService(svcIntent)
         }
+
+        // Real bug found+fixed 2026-09-01: a USB-attach launch (attachedDevice != null) used to
+        // fall through into the exact same full-UI path as a user opening the app from the
+        // launcher -- yanking the whole screen to the foreground over whatever was running (a
+        // game) on every single plug-in. Android auto-grants this activity USB permission for
+        // the device BEFORE onCreate runs (that's what the manifest USB_DEVICE_ATTACHED
+        // intent-filter + device_filter.xml match buys us), so by the time execution reaches
+        // here the grant already happened -- forwarding the device to the service above and
+        // finishing immediately loses nothing. The service's own checkAndRequestDevice() then
+        // sees usbManager.hasPermission(device) == true and skips requestPermission() entirely,
+        // so the repeated "OK this popup" dialog goes away too (that dialog only ever fired
+        // because a stale/second permission-less path was still reaching requestPermission()
+        // after the foreground grab -- eliminating the grab removes that path). No UI is ever
+        // shown for this launch; overridePendingTransition(0, 0) suppresses even the brief
+        // window-open animation flash.
+        if (attachedDevice != null) {
+            overridePendingTransition(0, 0)
+            finish()
+            return
+        }
+
+        setContentView(R.layout.activity_main)
+        statusView = findViewById(R.id.statusText)
+        devicesContainer = findViewById(R.id.devicesContainer)
+        findViewById<Button>(R.id.settingsButton).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        requestNotificationPermissionIfNeeded()
+
         bindService(svcIntent, connection, Context.BIND_AUTO_CREATE)
         bound = true
     }

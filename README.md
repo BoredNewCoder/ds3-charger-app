@@ -194,6 +194,18 @@ Two smaller follow-ups to the operational-sequence work above:
   is holding the interface so it still force-claims in practice, but it no longer needlessly
   evicts a driver when the interface is genuinely free.
 
+## No more foreground-grab / repeat permission popup on every plug-in (v1.4.7)
+
+USB-attach launches used to fall through into the exact same full-screen path as opening the
+app from the launcher — yanking the whole UI over whatever was running (a game) on every
+single plug-in, plus a USB-permission dialog to OK. When this activity is launched by the
+plug-in event, it now forwards the controller straight to the background service and
+`finish()`es immediately — no UI is ever shown for that launch. The manifest's
+`USB_DEVICE_ATTACHED` intent-filter (matched via `device_filter.xml`) still auto-grants USB
+permission to the app before `onCreate` even runs, so nothing is lost by skipping the
+foreground path — the service's own permission check now finds it already granted and skips
+the request dialog too.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
