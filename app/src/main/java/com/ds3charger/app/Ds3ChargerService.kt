@@ -439,7 +439,11 @@ class Ds3ChargerService : Service() {
             return
         }
         val intf = device.getInterface(0)
-        if (!connection.claimInterface(intf, true)) {
+        // Soft-claim first, force only if that fails: force=true kernel-detaches whatever HID driver
+        // currently owns the interface, and Android has no API to re-attach it afterwards. For a real
+        // DS3 the OS gamepad driver is holding it, so this still force-claims in practice - but if the
+        // interface is genuinely free (no driver bound) we don't needlessly evict anything.
+        if (!connection.claimInterface(intf, false) && !connection.claimInterface(intf, true)) {
             connection.close()
             retryChargeCommand(device, attempt, reservationId, "claimInterface failed")
             return
@@ -492,6 +496,26 @@ class Ds3ChargerService : Service() {
             Log.w("Ds3Charger", "operational step 3 skipped - no interrupt-OUT endpoint on interface")
         }
 
+        // #3: confirm the operational handshake actually engaged the charge circuit. Give the
+        // controller a moment, then read the battery byte - while USB-connected it should report
+        // charging/full (>=0xEE), not a 0-5 "on battery" index. If it still reads on-battery the
+        // handshake didn't take (happens on some clones even after step 3) - retry rather than
+        // reporting a controller that isn't actually charging as a success.
+        Thread.sleep(500)
+        val verifyBuf = ByteArray(INPUT_REPORT_SIZE)
+        val verifyResult = connection.controlTransfer(
+            0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, intf.id, verifyBuf, verifyBuf.size, 2000
+        )
+        val chargingConfirmed = verifyResult > BATTERY_BYTE_OFFSET &&
+            (verifyBuf[BATTERY_BYTE_OFFSET].toInt() and 0xFF) >= 0xEE
+        if (!chargingConfirmed && attempt < MAX_CHARGE_COMMAND_ATTEMPTS) {
+            connection.releaseInterface(intf)
+            connection.close()
+            retryChargeCommand(device, attempt, reservationId,
+                "operational sequence sent but controller still reports on-battery (verifyResult=$verifyResult)")
+            return
+        }
+
         // Release right away - holding it exclusively blocks any other
         // consumer (the game, the OS's own USB-HID path) for as long as
         // this service runs. Real regression found 2026-07-13 from an
@@ -502,8 +526,12 @@ class Ds3ChargerService : Service() {
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
         val infoLine = "Device: $name\nVID=0x${device.vendorId.toString(16)} " +
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
+        val state = DeviceState(connection, intf, infoLine, device.deviceId)
+        // Charging couldn't be confirmed after every attempt - say so honestly instead of letting the
+        // first pollBattery paint a normal-looking status over a controller that isn't charging.
+        if (!chargingConfirmed) state.lastStatus = "USB connected - charging not confirmed"
         synchronized(devices) {
-            devices[device.deviceId] = DeviceState(connection, intf, infoLine, device.deviceId)
+            devices[device.deviceId] = state
             pendingDeviceIds.remove(reservationId)
         }
         refreshUi()

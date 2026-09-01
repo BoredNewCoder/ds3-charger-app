@@ -176,6 +176,24 @@ the sequence.
 **Fixed**: after the `0xF5` `GET_REPORT`, the charge command now also does a best-effort
 1-byte `bulkTransfer` to the interface's interrupt-OUT endpoint, completing the port.
 
+## Verify charging actually engaged; soft-claim the interface (v1.4.6)
+
+Two smaller follow-ups to the operational-sequence work above:
+
+- **Charge verification.** The charge command used to declare success the moment the control
+  transfers returned without error — even if the controller never actually went operational.
+  It now reads the battery byte right after the handshake: while USB-connected it must report
+  charging/full (`>= 0xEE`), not a `0-5` "on battery" index. If it still reads on-battery the
+  handshake didn't take (some clones need more than one try even with step 3), so it retries
+  within the existing attempt budget instead of reporting a controller that isn't charging as
+  connected-and-fine. If every attempt fails to confirm, the status line says
+  `USB connected - charging not confirmed` rather than painting a normal-looking reading.
+- **Soft-claim first.** `claimInterface(force = true)` kernel-detaches whatever HID driver owns
+  the interface, and Android has no API to re-attach it. The charge command now tries a
+  non-forced claim first and only forces if that fails — for a real DS3 the OS gamepad driver
+  is holding the interface so it still force-claims in practice, but it no longer needlessly
+  evicts a driver when the interface is genuinely free.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
