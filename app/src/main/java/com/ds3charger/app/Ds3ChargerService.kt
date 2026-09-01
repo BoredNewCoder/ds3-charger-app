@@ -468,13 +468,28 @@ class Ds3ChargerService : Service() {
         // plausible battery status) while charging never actually engaged,
         // because the controller was never fully brought into operational
         // mode. Non-fatal if it fails (most controllers don't strictly need
-        // it) - logged, doesn't block the connection.
+        // it) - logged, doesn't block the connection. The "plus a USB
+        // interrupt" half of that kernel comment is step 3 below - the two
+        // GET_REPORTs are only the "another query" part.
         val buf2 = ByteArray(8)
         val result2 = connection.controlTransfer(0xA1, 0x01, 0x03F5, intf.id, buf2, buf2.size, 5000)
         if (result2 < 0) {
             Log.w("Ds3Charger", "operational step 2 (0xF5) failed, result=$result2 - continuing anyway")
         } else {
             Log.d("Ds3Charger", "operational step 2 (0xF5) OK, result=$result2 bytes=${buf2.take(8)}")
+        }
+
+        // Step 3 of sixaxis_set_operational_usb(): "another query plus a USB interrupt". The two
+        // GET_REPORTs above are the queries; this is the interrupt-OUT write hid-sony.c flags as
+        // required for SHANWAN/compatible (clone) boards to actually go operational - without it a
+        // clone reads input reports fine but its charge circuit never engages. Best-effort.
+        val opKickEp = (0 until intf.endpointCount).map { intf.getEndpoint(it) }
+            .firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
+        if (opKickEp != null) {
+            val kickResult = connection.bulkTransfer(opKickEp, ByteArray(1), 1, 2000)
+            Log.d("Ds3Charger", "operational step 3 (interrupt-OUT kick) result=$kickResult")
+        } else {
+            Log.w("Ds3Charger", "operational step 3 skipped - no interrupt-OUT endpoint on interface")
         }
 
         // Release right away - holding it exclusively blocks any other

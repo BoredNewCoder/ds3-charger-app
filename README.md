@@ -157,6 +157,25 @@ changed) instead of trusting the original reference. Also added logging to every
 give-up path in this chain, which was completely silent before — a real diagnosis gap in
 its own right.
 
+## Complete the operational-mode sequence — interrupt-OUT kick (v1.4.5)
+
+The kernel's `sixaxis_set_operational_usb()` (the sequence that brings a DS3 into
+operational mode so its charge circuit engages) is three steps: `GET_REPORT 0xF2`,
+`GET_REPORT 0xF5`, then **a 1-byte write to the interrupt-OUT endpoint**. The app did the
+first two but never the third — even though the kernel comment it quotes says *"some
+compatible controllers... need another query **plus a USB interrupt** to get operational."*
+The two `GET_REPORT`s are the "another query" half; the interrupt-OUT write is the missing
+"plus a USB interrupt" half.
+
+**Symptom**: on a Shanwan/Gasia clone board (which is exactly the "compatible controller"
+the kernel flag `SHANWAN_GAMEPAD` covers), the controller answers HID input reports fine —
+so the app shows a plausible battery reading — but its charge circuit never actually turns
+on. Same class of bug as the v1.4.3-era "step 2 was missing" issue, one step further down
+the sequence.
+
+**Fixed**: after the `0xF5` `GET_REPORT`, the charge command now also does a best-effort
+1-byte `bulkTransfer` to the interface's interrupt-OUT endpoint, completing the port.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
