@@ -22,6 +22,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.text.SimpleDateFormat
@@ -167,6 +168,13 @@ class Ds3ChargerService : Service() {
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
         var consecutivePollFailures: Int = 0,
+        // elapsedRealtime() of the first "Charging" (0xEE) reading seen since
+        // this device attached; 0 = never seen charging yet. Used to hold off
+        // trusting an early "full" byte - see FULL_CONFIRM_POLLS below.
+        var chargingSinceMs: Long = 0L,
+        // Consecutive polls byte 30 has reported "full" (0xEF). Debounces a
+        // transient/early full reading before it's relayed as 100% / "Full".
+        var fullReadingStreak: Int = 0,
         var authCheckResult: AuthCheckResult? = null,
     )
 
@@ -214,6 +222,20 @@ class Ds3ChargerService : Service() {
     // interval setting. Once it hits Full or sits "On battery", drop back to
     // the base interval - no urgency there.
     private val FAST_POLL_INTERVAL_MS = 30_000L
+
+    // "Fully charged" gate. The DS3's charge controller (and clone boards
+    // especially - this app targets a Shanwan clone) flips byte 30's low bit
+    // to "done" (0xEF) noticeably before the pack is actually topped off: a
+    // 2026-08-14 bench test read "100% / Full" on the Shield but only "High"
+    // on a PC's battery tool seconds later, with no time to have drained. So
+    // a bare 0xEF is not trusted on its own - it must (a) hold across this
+    // many consecutive polls and (b) come after the controller has been
+    // charging for at least MIN_CHARGE_BEFORE_FULL_MS. Until both clear, the
+    // status stays "Charging (topping off)" rather than "Full". A controller
+    // that already read full on its first poll (never charged, so
+    // chargingSinceMs stays 0) skips the time gate but still needs the streak.
+    private val FULL_CONFIRM_POLLS = 3
+    private val MIN_CHARGE_BEFORE_FULL_MS = 25 * 60 * 1000L
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var listener: Listener? = null
@@ -297,7 +319,7 @@ class Ds3ChargerService : Service() {
                         Log.e("Ds3Charger", "pollBattery failed for deviceId=${state.deviceId}: ${e.message}", e)
                     }
                 }
-                anyCharging = snapshot.any { it.lastStatus == "Charging" }
+                anyCharging = snapshot.any { it.lastStatus == "Charging" || it.lastStatus == "Charging (topping off)" }
                 pollBluetoothControllers()
                 // Single refresh after the whole batch - pollBattery used to call
                 // this per-device, so N controllers meant N notify()/listener
@@ -616,6 +638,7 @@ class Ds3ChargerService : Service() {
         }
         state.consecutivePollFailures = 0
         val raw = buf[BATTERY_BYTE_OFFSET].toInt() and 0xFF
+        Log.d("Ds3Charger", "deviceId=${state.deviceId} battery byte 30 = 0x%02x".format(raw))
         // Real hardware limit, not a parsing gap: while actively charging the DS3's own
         // charge controller owns this byte and only ever reports "still charging" vs
         // "full" - no live percentage is transmitted (confirmed against both the Linux
@@ -623,8 +646,33 @@ class Ds3ChargerService : Service() {
         // real percentage available" so the UI can show "Charging..." honestly instead
         // of a fake number, rather than reusing the unrelated Full=100 value.
         val (pct, status) = when {
-            raw >= 0xee -> (if (raw and 0x01 == 1) 100 else -1) to (if (raw and 0x01 == 1) "Full" else "Charging")
-            else -> SIXAXIS_BATTERY_CAPACITY[minOf(raw, 5)] to "On battery (not charging)"
+            raw >= 0xee -> {
+                if (raw and 0x01 != 1) {
+                    // Low bit clear (0xEE) = still charging. No live % on the wire.
+                    if (state.chargingSinceMs == 0L) state.chargingSinceMs = SystemClock.elapsedRealtime()
+                    state.fullReadingStreak = 0
+                    -1 to "Charging"
+                } else {
+                    // Low bit set (0xEF) = "done charging". Don't relay that as
+                    // Full until it has held for FULL_CONFIRM_POLLS in a row AND
+                    // the controller has been charging at least
+                    // MIN_CHARGE_BEFORE_FULL_MS - see those constants for why an
+                    // early 0xEF on this hardware lies.
+                    state.fullReadingStreak++
+                    val chargedLongEnough = state.chargingSinceMs == 0L ||
+                        SystemClock.elapsedRealtime() - state.chargingSinceMs >= MIN_CHARGE_BEFORE_FULL_MS
+                    if (state.fullReadingStreak >= FULL_CONFIRM_POLLS && chargedLongEnough) {
+                        100 to "Full"
+                    } else {
+                        -1 to "Charging (topping off)"
+                    }
+                }
+            }
+            else -> {
+                state.chargingSinceMs = 0L
+                state.fullReadingStreak = 0
+                SIXAXIS_BATTERY_CAPACITY[minOf(raw, 5)] to "On battery (not charging)"
+            }
         }
         // Fire the charge-complete alert on the Charging->Full edge only -
         // that's the one real transition the hardware exposes while plugged
@@ -632,7 +680,10 @@ class Ds3ChargerService : Service() {
         // Charging vs Full). Guarded on the previous status specifically
         // (not "status changed") so a fresh poll of an already-Full
         // controller, or Full->unplugged, never fires one.
-        if (status == "Full" && state.lastStatus == "Charging" && Prefs.isChargeAlertsEnabled(this)) {
+        if (status == "Full" &&
+            (state.lastStatus == "Charging" || state.lastStatus == "Charging (topping off)") &&
+            Prefs.isChargeAlertsEnabled(this)
+        ) {
             sendChargeCompleteAlert(state)
         }
         // Edge-triggered the same way as the charge-complete alert (real
@@ -1004,7 +1055,7 @@ class Ds3ChargerService : Service() {
     // show that honestly instead of a fake/stale number (see the comment at the
     // battery-byte decode site for why this happens).
     private fun formatBatteryLine(time: String, pct: Int, status: String): String =
-        if (pct == -1) "[$time] Charging..." else "[$time] Battery: $pct%  ($status)"
+        if (pct == -1) "[$time] $status..." else "[$time] Battery: $pct%  ($status)"
 
     private fun buildStatusText(): String {
         val snapshot = synchronized(devices) { devices.values.toList() }

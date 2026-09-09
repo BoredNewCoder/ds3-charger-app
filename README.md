@@ -206,6 +206,23 @@ permission to the app before `onCreate` even runs, so nothing is lost by skippin
 foreground path — the service's own permission check now finds it already granted and skips
 the request dialog too.
 
+## Don't trust an early "fully charged" (v1.4.8)
+
+The status jumped to **100% / Full** after only a few minutes of charging and then stopped
+reporting progress. Byte 30 of the input report is the only charge signal the DS3 exposes, and
+its low bit ("done charging") flips well before the pack is actually topped off — worse on the
+Shanwan clone board this app targets, and on an old, degraded cell. A 2026-08-14 bench test
+showed it: "100% / Full" on the Shield, but a PC battery tool read only "High" seconds later,
+with no time to have drained.
+
+A bare `0xEF` is no longer relayed as Full on its own. It now has to (a) hold across three
+consecutive polls and (b) come after the controller has been charging for at least 25 minutes.
+Until both clear, the status reads **"Charging (topping off)…"** and the fast 30-second poll
+stays active. A controller that already reads full on its first poll (so it was never seen
+charging) skips the time gate but still needs the three-poll streak. The charge-complete alert
+still fires once, on the real transition into Full. Each poll now also logs the raw byte-30
+value (`adb logcat -s Ds3Charger`) so a future mismatch can be diagnosed from real data.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
