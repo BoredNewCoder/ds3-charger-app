@@ -222,24 +222,27 @@ class Ds3ChargerService : Service() {
     // interval setting. Once it hits Full or sits "On battery", drop back to
     // the base interval - no urgency there.
     //
-    // Tightened 30_000 -> 1_000 (2026-09-11, live Shield-TV-via-USB-hub investigation): this
-    // device's own USB power/autosuspend_delay_ms (read via adb from
-    // /sys/bus/usb/devices/.../power/autosuspend_delay_ms) is 2000ms. Genuine bus traffic is what
-    // resets a Linux USB device's runtime-PM idle timer (documented kernel behavior, see
-    // kernel.org/doc/Documentation/usb/power-management.txt) - a 30s gap between polls is 15x
-    // longer than that, so the kernel is free to consider the device (or an in-between hub sitting
-    // in its default power/control=auto policy, which this app cannot override without root - checked,
-    // adb shell got "Permission denied" writing to the hub's own power/control node) idle and eligible
-    // to autosuspend between polls during a real charge. Observed live: 0.20A real charging current
-    // (confirmed on an external ammeter) through a USB hub dropped to 0A on its own while the
-    // controller stayed genuinely attached (still enumerating, not a disconnect) - consistent with,
-    // but not proven to be caused by, a suspend/resume cycle landing in the ~29s dead gap between
-    // 30s polls. Un-provable further without root (can't force the hub to stay "on" to A/B test it).
-    // The fix is cheap regardless: a single GET_REPORT read every second, paid only while a charge is
-    // genuinely in progress (bounded, finite state) - real bus traffic every second stays safely under
-    // the observed 2000ms threshold, at negligible CPU/battery cost on an always-plugged-in TV box,
-    // with zero downside if this ends up not being the whole story.
-    private val FAST_POLL_INTERVAL_MS = 1_000L
+    // REVERTED 1_000 -> 30_000 (2026-09-11, same-night follow-up). The 2026-09-11 tightening
+    // above (kept in git history, see commit 9d384fa) reasoned that a shorter poll gap would
+    // reduce USB idle-suspend risk during a real charge - but pollBattery() does a FORCE
+    // claimInterface -> read -> releaseInterface on every single poll (see pollBattery's own
+    // comment: deliberate, so the interface isn't held exclusively and starved from other
+    // consumers - real regression 2026-07-13 from an earlier version holding it continuously).
+    // At the tightened 1s interval that force-claim/release cycle - which itself briefly steals
+    // the interface from whatever else has it - was firing 30x more often than before. Live-
+    // observed immediately after installing that version: 0.20A real charging current (external
+    // ammeter) dropped to 0A after ~5 seconds - roughly 5 poll cycles at the new 1Hz rate. That
+    // timing is far too short to be the battery finishing a real charge, and lines up with
+    // "the poll's own claim/release cycle is disrupting the DS3's operational/charge-enabled
+    // state" much better than with "USB autosuspend snuck in during a 30s gap" ever did. The
+    // 1s tightening's own justification was explicitly speculative ("consistent with, but not
+    // proven") - reverting rather than compounding one unproven theory on top of another.
+    // Net: this app cannot fix the charging problem from software (established earlier the same
+    // night: no write path to the device's charge circuit, no Android API to pin USB power
+    // state without root) - the real fix is a USB hub upstream of the Shield's own weak ports,
+    // full stop. Polling interval doesn't change whether current flows; keeping it at the
+    // original, long-tested value is the safer default until/unless real evidence says otherwise.
+    private val FAST_POLL_INTERVAL_MS = 30_000L
 
     // "Fully charged" gate. The DS3's charge controller (and clone boards
     // especially - this app targets a Shanwan clone) flips byte 30's low bit
