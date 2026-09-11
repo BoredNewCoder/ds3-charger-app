@@ -765,7 +765,10 @@ class Ds3ChargerService : Service() {
         state.connection = newConnection
         state.intf = newIntf
         state.device = fresh
-        Log.i("Ds3Charger", "deviceId=${state.deviceId} precharge retry ${if (reconnected) "confirmed operational" else "reconnected but not yet confirmed operational"}")
+        // "reconnected" only means the handshake got a >=0xEE reply post-kick - 0xF1 (stuck/fault)
+        // satisfies that too, so this is NOT proof the retry produced a real charge. Only a
+        // later raw==0xEE poll (low bit clear) is real confirmation.
+        Log.i("Ds3Charger", "deviceId=${state.deviceId} precharge retry ${if (reconnected) "back in operational mode" else "reconnected but handshake verify failed"}")
         return reconnected
     }
 
@@ -819,21 +822,8 @@ class Ds3ChargerService : Service() {
                     // interpretation - but see FULL_PRECHARGE_RETRY_INTERVAL_MS's doc comment:
                     // live-confirmed this reads far too early to be a genuine full charge on a
                     // deeply-discharged cell, and is very likely actually the bqTINY-II charge
-                    // IC's FAULT/safety-timeout state. When this shows up before ever having
-                    // seen a real 0xEE first (chargingSinceMs still 0), periodically force a
-                    // full reconnect to give the cell another real precharge attempt - bounded
-                    // by MAX_PRECHARGE_RETRIES so a controller that's genuinely already full on
-                    // connect (indistinguishable from the stuck case by this byte alone) doesn't
-                    // get reconnect-spammed forever.
-                    if (state.chargingSinceMs == 0L && state.prechargeRetryCount < MAX_PRECHARGE_RETRIES) {
-                        val nowMs = SystemClock.elapsedRealtime()
-                        if (nowMs - state.lastFullReconnectAttemptMs >= FULL_PRECHARGE_RETRY_INTERVAL_MS) {
-                            state.lastFullReconnectAttemptMs = nowMs
-                            state.prechargeRetryCount++
-                            Log.w("Ds3Charger", "deviceId=${state.deviceId} stuck reporting 'done' (raw=0x%02x) without ever confirming real charging - precharge retry ${state.prechargeRetryCount}/$MAX_PRECHARGE_RETRIES".format(raw))
-                            attemptFullPrechargeRetry(state)
-                        }
-                    }
+                    // IC's FAULT/safety-timeout state.
+                    //
                     // Don't relay a bare 0xEF/0xF1 as Full until it has held for
                     // FULL_CONFIRM_POLLS in a row AND the controller has been charging at least
                     // MIN_CHARGE_BEFORE_FULL_MS - see those constants for why an early 0xEF on
@@ -841,7 +831,28 @@ class Ds3ChargerService : Service() {
                     state.fullReadingStreak++
                     val chargedLongEnough = state.chargingSinceMs == 0L ||
                         SystemClock.elapsedRealtime() - state.chargingSinceMs >= MIN_CHARGE_BEFORE_FULL_MS
-                    if (state.fullReadingStreak >= FULL_CONFIRM_POLLS && chargedLongEnough) {
+                    val confirmedFull = state.fullReadingStreak >= FULL_CONFIRM_POLLS && chargedLongEnough
+
+                    // Live-confirmed 2026-09-11: one real 0xEE reading (setting chargingSinceMs)
+                    // used to permanently disable this retry, on the theory that a real charge
+                    // had started and would finish on its own. Real log showed that's false - the
+                    // reading can revert to stuck 0xF1 seconds later, and neither this retry nor
+                    // the re-arm branch below could fire again (re-arm needs raw<0xEE, which
+                    // never happened - it went straight from 0xEE back to 0xF1). So retry any
+                    // time we're NOT yet confirmed Full, not just before the first 0xEE - bounded
+                    // by MAX_PRECHARGE_RETRIES so a controller that's genuinely full doesn't get
+                    // reconnect-spammed forever once confirmedFull is true.
+                    if (!confirmedFull && state.prechargeRetryCount < MAX_PRECHARGE_RETRIES) {
+                        val nowMs = SystemClock.elapsedRealtime()
+                        if (nowMs - state.lastFullReconnectAttemptMs >= FULL_PRECHARGE_RETRY_INTERVAL_MS) {
+                            state.lastFullReconnectAttemptMs = nowMs
+                            state.prechargeRetryCount++
+                            Log.w("Ds3Charger", "deviceId=${state.deviceId} stuck reporting 'done' (raw=0x%02x) - precharge retry ${state.prechargeRetryCount}/$MAX_PRECHARGE_RETRIES".format(raw))
+                            attemptFullPrechargeRetry(state)
+                        }
+                    }
+
+                    if (confirmedFull) {
                         100 to "Full"
                     } else {
                         -1 to "Charging (topping off)"
