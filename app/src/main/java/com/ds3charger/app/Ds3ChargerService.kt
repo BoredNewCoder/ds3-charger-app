@@ -591,6 +591,30 @@ class Ds3ChargerService : Service() {
             pendingDeviceIds.remove(reservationId)
         }
         refreshUi()
+
+        // REAL BUG found+fixed 2026-09-11 (live investigation, not guessed): pollRunnable is a
+        // single shared timer loop started once in onCreate() and rescheduled only from its own
+        // `finally` block - a freshly-connected device does NOT reset or trigger it. Its interval
+        // defaults to Prefs.DEFAULT_POLL_INTERVAL_MIN = **15 minutes** (FAST_POLL_INTERVAL_MS only
+        // ever applies once anyCharging is already true from a PRIOR tick's result - a bootstrap
+        // gap, this device has never been polled yet). Confirmed live: a controller was observed
+        // dropping current within seconds of connecting, but zero pollBattery calls (and so zero
+        // chances for the re-arm logic above to ever run) had fired in over a minute since attach -
+        // the global loop simply hadn't ticked yet. This app could sit blind to a fast charge-drop
+        // for up to 15 real minutes on a fresh connect, by design, without anyone noticing. Fix:
+        // poll THIS device immediately (seeds lastStatus/chargingSinceMs right away instead of
+        // leaving them at their just-constructed defaults) and bump the shared loop's next tick up
+        // to FAST_POLL_INTERVAL_MS regardless of what was left on its previous countdown, so every
+        // controller gets watched closely for the first stretch after it connects, not just once
+        // it happens to already be mid-"Charging" from an earlier successful poll.
+        try {
+            pollBattery(state)
+        } catch (e: Throwable) {
+            Log.e("Ds3Charger", "immediate post-connect pollBattery failed for deviceId=${device.deviceId}: ${e.message}", e)
+        }
+        bgHandler.removeCallbacks(pollRunnable)
+        bgHandler.postDelayed(pollRunnable, FAST_POLL_INTERVAL_MS)
+        refreshUi()
     }
 
     // A transient claim/transfer failure (device still enumerating, briefly
