@@ -59,55 +59,7 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Real bug found+fixed 2026-08-17: when this app is the registered default handler
-        // for the DS3's device_filter (the normal case after first-time setup), Android
-        // delivers USB_DEVICE_ATTACHED by launching THIS activity directly with the device in
-        // the intent -- it does NOT also send a general broadcast that the service's own
-        // Context-registered usbReceiver would catch. Previously this intent's device extra
-        // was silently discarded (the service was just started/bound generically), so a
-        // controller plugged in while the app/service wasn't already tracking it -- e.g. a
-        // fully powered-off DS3, since it enumerates fresh on every plug -- never actually
-        // triggered the charge-command handshake at all. Confirmed live: MainActivity launched,
-        // zero Ds3Charger log lines, "No DualShock 3 connected" shown despite the controller
-        // being plugged in and USB permission already granted. Forwarding the device through
-        // to the service closes the gap.
-        @Suppress("DEPRECATION")
-        val attachedDevice: android.hardware.usb.UsbDevice? =
-            if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
-                intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE)
-            } else null
-
-        val svcIntent = Intent(this, Ds3ChargerService::class.java).apply {
-            if (attachedDevice != null) {
-                action = android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED
-                putExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE, attachedDevice)
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(svcIntent)
-        } else {
-            startService(svcIntent)
-        }
-
-        // Real bug found+fixed 2026-09-01: a USB-attach launch (attachedDevice != null) used to
-        // fall through into the exact same full-UI path as a user opening the app from the
-        // launcher -- yanking the whole screen to the foreground over whatever was running (a
-        // game) on every single plug-in. Android auto-grants this activity USB permission for
-        // the device BEFORE onCreate runs (that's what the manifest USB_DEVICE_ATTACHED
-        // intent-filter + device_filter.xml match buys us), so by the time execution reaches
-        // here the grant already happened -- forwarding the device to the service above and
-        // finishing immediately loses nothing. The service's own checkAndRequestDevice() then
-        // sees usbManager.hasPermission(device) == true and skips requestPermission() entirely,
-        // so the repeated "OK this popup" dialog goes away too (that dialog only ever fired
-        // because a stale/second permission-less path was still reaching requestPermission()
-        // after the foreground grab -- eliminating the grab removes that path). No UI is ever
-        // shown for this launch; overridePendingTransition(0, 0) suppresses even the brief
-        // window-open animation flash.
-        if (attachedDevice != null) {
-            overridePendingTransition(0, 0)
-            finish()
-            return
-        }
+        if (handleUsbAttachIntent(intent)) return
 
         setContentView(R.layout.activity_main)
         statusView = findViewById(R.id.statusText)
@@ -118,8 +70,76 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
 
         requestNotificationPermissionIfNeeded()
 
-        bindService(svcIntent, connection, Context.BIND_AUTO_CREATE)
+        bindService(Intent(this, Ds3ChargerService::class.java), connection, Context.BIND_AUTO_CREATE)
         bound = true
+    }
+
+    // Real bug found+fixed 2026-09-11: MainActivity is launchMode="singleTask" - once its task
+    // exists (a prior attach launched+finished it and the empty task lingered, or the user opened
+    // the UI and left it backgrounded), Android delivers a REPEAT USB_DEVICE_ATTACHED intent here
+    // via onNewIntent(), not onCreate() - and no onNewIntent() override existed, so it was a
+    // silent no-op. The device never reached the service through the "already auto-granted" path
+    // below; the service's own independent attach handling picked it up instead, hasPermission()
+    // came back false (the manifest's silent grant only applies to a fresh onCreate launch), and
+    // it fell to requestPermission() - the real system dialog - while this activity also uselessly
+    // popped to the foreground doing nothing. That's exactly the "back out of the app, then tap
+    // the dialog" symptom reported live: every replug after the first hit this dead path.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUsbAttachIntent(intent)
+    }
+
+    // Real bug found+fixed 2026-08-17: when this app is the registered default handler
+    // for the DS3's device_filter (the normal case after first-time setup), Android
+    // delivers USB_DEVICE_ATTACHED by launching THIS activity directly with the device in
+    // the intent -- it does NOT also send a general broadcast that the service's own
+    // Context-registered usbReceiver would catch. Previously this intent's device extra
+    // was silently discarded (the service was just started/bound generically), so a
+    // controller plugged in while the app/service wasn't already tracking it -- e.g. a
+    // fully powered-off DS3, since it enumerates fresh on every plug -- never actually
+    // triggered the charge-command handshake at all. Confirmed live: MainActivity launched,
+    // zero Ds3Charger log lines, "No DualShock 3 connected" shown despite the controller
+    // being plugged in and USB permission already granted. Forwarding the device through
+    // to the service closes the gap.
+    //
+    // Real bug found+fixed 2026-09-01: a USB-attach launch (attachedDevice != null) used to
+    // fall through into the exact same full-UI path as a user opening the app from the
+    // launcher -- yanking the whole screen to the foreground over whatever was running (a
+    // game) on every single plug-in. Android auto-grants this activity USB permission for
+    // the device BEFORE this runs (that's what the manifest USB_DEVICE_ATTACHED
+    // intent-filter + device_filter.xml match buys us), so by the time execution reaches
+    // here the grant already happened -- forwarding the device to the service and
+    // finishing immediately loses nothing. The service's own checkAndRequestDevice() then
+    // sees usbManager.hasPermission(device) == true and skips requestPermission() entirely,
+    // so the "OK this popup" dialog goes away too. No UI is ever shown for this launch;
+    // overridePendingTransition(0, 0) suppresses even the brief window-open animation flash.
+    //
+    // Shared by onCreate + onNewIntent (see onNewIntent's doc comment above - a singleTask
+    // activity can receive the SAME USB_DEVICE_ATTACHED intent through either entry point
+    // depending on whether its task already exists). Returns true if this WAS an attach
+    // intent (caller should skip normal UI init - the activity already finished itself).
+    private fun handleUsbAttachIntent(intent: Intent?): Boolean {
+        @Suppress("DEPRECATION")
+        val attachedDevice: android.hardware.usb.UsbDevice? =
+            if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+                intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE)
+            } else null
+        if (attachedDevice == null) return false
+
+        val svcIntent = Intent(this, Ds3ChargerService::class.java).apply {
+            action = android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED
+            putExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE, attachedDevice)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(svcIntent)
+        } else {
+            startService(svcIntent)
+        }
+
+        overridePendingTransition(0, 0)
+        finish()
+        return true
     }
 
     private fun requestNotificationPermissionIfNeeded() {
