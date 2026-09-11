@@ -221,7 +221,25 @@ class Ds3ChargerService : Service() {
     // fast so the notification reacts quickly, regardless of the user's base
     // interval setting. Once it hits Full or sits "On battery", drop back to
     // the base interval - no urgency there.
-    private val FAST_POLL_INTERVAL_MS = 30_000L
+    //
+    // Tightened 30_000 -> 1_000 (2026-09-11, live Shield-TV-via-USB-hub investigation): this
+    // device's own USB power/autosuspend_delay_ms (read via adb from
+    // /sys/bus/usb/devices/.../power/autosuspend_delay_ms) is 2000ms. Genuine bus traffic is what
+    // resets a Linux USB device's runtime-PM idle timer (documented kernel behavior, see
+    // kernel.org/doc/Documentation/usb/power-management.txt) - a 30s gap between polls is 15x
+    // longer than that, so the kernel is free to consider the device (or an in-between hub sitting
+    // in its default power/control=auto policy, which this app cannot override without root - checked,
+    // adb shell got "Permission denied" writing to the hub's own power/control node) idle and eligible
+    // to autosuspend between polls during a real charge. Observed live: 0.20A real charging current
+    // (confirmed on an external ammeter) through a USB hub dropped to 0A on its own while the
+    // controller stayed genuinely attached (still enumerating, not a disconnect) - consistent with,
+    // but not proven to be caused by, a suspend/resume cycle landing in the ~29s dead gap between
+    // 30s polls. Un-provable further without root (can't force the hub to stay "on" to A/B test it).
+    // The fix is cheap regardless: a single GET_REPORT read every second, paid only while a charge is
+    // genuinely in progress (bounded, finite state) - real bus traffic every second stays safely under
+    // the observed 2000ms threshold, at negligible CPU/battery cost on an always-plugged-in TV box,
+    // with zero downside if this ends up not being the whole story.
+    private val FAST_POLL_INTERVAL_MS = 1_000L
 
     // "Fully charged" gate. The DS3's charge controller (and clone boards
     // especially - this app targets a Shanwan clone) flips byte 30's low bit
