@@ -473,6 +473,60 @@ class Ds3ChargerService : Service() {
     // differ from the original if the kernel re-enumerated the physical device under a
     // new bus path in between attempts. Always clear the RESERVATION id, not whatever
     // the current device object happens to report.
+    // Steps 2+3 of sixaxis_set_operational_usb() (0xF5 GET_REPORT + interrupt-OUT kick) plus the
+    // post-kick verification read. Extracted 2026-09-11 so pollBattery's re-arm path (see its
+    // `else` branch below) can replay exactly this sequence on an already-open, already-tracked
+    // connection - not just at initial connect time. Real cause found+confirmed live this same
+    // night: `com.nvidia.bluetooth.ps3usbpairer`, an NVIDIA Shield SYSTEM app, has its own
+    // registered `android.hardware.usb.action.USB_DEVICE_ATTACHED` receiver (confirmed via
+    // `dumpsys package com.nvidia.bluetooth.ps3usbpairer` - not stale, not theoretical) that
+    // fires on the SAME broadcast this app's own usbReceiver listens for, and independently
+    // claims/releases the SAME USB interface to attempt its own Bluetooth-pairing flow. This was
+    // already flagged as "real contributing churn, not just theoretical" back on 2026-08-18
+    // (see retryChargeCommand's doc comment) for connect-time failures; this re-arm path is the
+    // same fix applied to a controller that already connected successfully and later got
+    // knocked back out of operational mode by that same competing claim. Interface must already
+    // be claimed by the caller - this function does NOT claim/release it, so it composes inside
+    // either sendChargeCommandAttempt's or pollBattery's own claim/release bracket.
+    private fun sendOperationalKickAndVerify(connection: UsbDeviceConnection, intf: UsbInterface): Boolean {
+        // Kernel comment: "some compatible controllers... need another query plus a USB
+        // interrupt to get operational." Real-world consequence found 2026-08-13: a controller
+        // could read HID input reports fine (so the app showed a plausible battery status)
+        // while charging never actually engaged, because the controller was never fully brought
+        // into operational mode. Non-fatal if this GET_REPORT fails (most controllers don't
+        // strictly need it) - logged, doesn't block the rest of the sequence.
+        val buf2 = ByteArray(8)
+        val result2 = connection.controlTransfer(0xA1, 0x01, 0x03F5, intf.id, buf2, buf2.size, 5000)
+        if (result2 < 0) {
+            Log.w("Ds3Charger", "operational step 2 (0xF5) failed, result=$result2 - continuing anyway")
+        } else {
+            Log.d("Ds3Charger", "operational step 2 (0xF5) OK, result=$result2 bytes=${buf2.take(8)}")
+        }
+
+        // "another query plus a USB interrupt" - this is the interrupt-OUT write hid-sony.c
+        // flags as required for SHANWAN/compatible (clone) boards to actually go operational -
+        // without it a clone reads input reports fine but its charge circuit never engages.
+        val opKickEp = (0 until intf.endpointCount).map { intf.getEndpoint(it) }
+            .firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
+        if (opKickEp != null) {
+            val kickResult = connection.bulkTransfer(opKickEp, ByteArray(1), 1, 2000)
+            Log.d("Ds3Charger", "operational step 3 (interrupt-OUT kick) result=$kickResult")
+        } else {
+            Log.w("Ds3Charger", "operational step 3 skipped - no interrupt-OUT endpoint on interface")
+        }
+
+        // Confirm the handshake actually engaged the charge circuit. Give the controller a
+        // moment, then read the battery byte - while USB-connected it should report
+        // charging/full (>=0xEE), not a 0-5 "on battery" index.
+        Thread.sleep(500)
+        val verifyBuf = ByteArray(INPUT_REPORT_SIZE)
+        val verifyResult = connection.controlTransfer(
+            0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, intf.id, verifyBuf, verifyBuf.size, 2000
+        )
+        return verifyResult > BATTERY_BYTE_OFFSET &&
+            (verifyBuf[BATTERY_BYTE_OFFSET].toInt() and 0xFF) >= 0xEE
+    }
+
     private fun sendChargeCommandAttempt(device: UsbDevice, attempt: Int, reservationId: Int) {
         if (devices.containsKey(device.deviceId)) return  // already tracked by an earlier attempt
 
@@ -506,56 +560,15 @@ class Ds3ChargerService : Service() {
             return
         }
 
-        // Step 2 of sixaxis_set_operational_usb() - GET_REPORT feature report
-        // 0xF5, 8-byte buffer. THIS APP WAS MISSING THIS ENTIRELY until now -
-        // only step 1 above was ever implemented. Kernel comment: "some
-        // compatible controllers... need another query plus a USB interrupt
-        // to get operational." Real-world consequence found 2026-08-13: a
-        // controller could read HID input reports fine (so the app showed a
-        // plausible battery status) while charging never actually engaged,
-        // because the controller was never fully brought into operational
-        // mode. Non-fatal if it fails (most controllers don't strictly need
-        // it) - logged, doesn't block the connection. The "plus a USB
-        // interrupt" half of that kernel comment is step 3 below - the two
-        // GET_REPORTs are only the "another query" part.
-        val buf2 = ByteArray(8)
-        val result2 = connection.controlTransfer(0xA1, 0x01, 0x03F5, intf.id, buf2, buf2.size, 5000)
-        if (result2 < 0) {
-            Log.w("Ds3Charger", "operational step 2 (0xF5) failed, result=$result2 - continuing anyway")
-        } else {
-            Log.d("Ds3Charger", "operational step 2 (0xF5) OK, result=$result2 bytes=${buf2.take(8)}")
-        }
-
-        // Step 3 of sixaxis_set_operational_usb(): "another query plus a USB interrupt". The two
-        // GET_REPORTs above are the queries; this is the interrupt-OUT write hid-sony.c flags as
-        // required for SHANWAN/compatible (clone) boards to actually go operational - without it a
-        // clone reads input reports fine but its charge circuit never engages. Best-effort.
-        val opKickEp = (0 until intf.endpointCount).map { intf.getEndpoint(it) }
-            .firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
-        if (opKickEp != null) {
-            val kickResult = connection.bulkTransfer(opKickEp, ByteArray(1), 1, 2000)
-            Log.d("Ds3Charger", "operational step 3 (interrupt-OUT kick) result=$kickResult")
-        } else {
-            Log.w("Ds3Charger", "operational step 3 skipped - no interrupt-OUT endpoint on interface")
-        }
-
-        // #3: confirm the operational handshake actually engaged the charge circuit. Give the
-        // controller a moment, then read the battery byte - while USB-connected it should report
-        // charging/full (>=0xEE), not a 0-5 "on battery" index. If it still reads on-battery the
-        // handshake didn't take (happens on some clones even after step 3) - retry rather than
-        // reporting a controller that isn't actually charging as a success.
-        Thread.sleep(500)
-        val verifyBuf = ByteArray(INPUT_REPORT_SIZE)
-        val verifyResult = connection.controlTransfer(
-            0xA1, 0x01, (0x01 shl 8) or INPUT_REPORT_ID, intf.id, verifyBuf, verifyBuf.size, 2000
-        )
-        val chargingConfirmed = verifyResult > BATTERY_BYTE_OFFSET &&
-            (verifyBuf[BATTERY_BYTE_OFFSET].toInt() and 0xFF) >= 0xEE
+        // Steps 2+3 of sixaxis_set_operational_usb() + the confirm-read - see
+        // sendOperationalKickAndVerify's doc comment for the full detail and why it's factored
+        // out (pollBattery's re-arm path below replays the same sequence).
+        val chargingConfirmed = sendOperationalKickAndVerify(connection, intf)
         if (!chargingConfirmed && attempt < MAX_CHARGE_COMMAND_ATTEMPTS) {
             connection.releaseInterface(intf)
             connection.close()
             retryChargeCommand(device, attempt, reservationId,
-                "operational sequence sent but controller still reports on-battery (verifyResult=$verifyResult)")
+                "operational sequence sent but controller still reports on-battery")
             return
         }
 
@@ -690,8 +703,29 @@ class Ds3ChargerService : Service() {
                 }
             }
             else -> {
+                // Re-arm: this controller previously read >=0xEE (a real USB-charging/full
+                // report) and has now dropped back to an on-battery index while STILL
+                // USB-tracked - a genuine unplug removes it from `devices` entirely via
+                // ACTION_USB_DEVICE_DETACHED (see usbReceiver above), so this can only mean
+                // something knocked it OUT of operational mode while the physical connection
+                // stayed up. See sendOperationalKickAndVerify's doc comment for the confirmed
+                // real cause (com.nvidia.bluetooth.ps3usbpairer's own USB_DEVICE_ATTACHED
+                // receiver competing for the same interface). Re-send just the kick+verify half
+                // of the handshake - cheap, and doesn't need a full reconnect/reopen.
+                val wasOperational = state.chargingSinceMs != 0L ||
+                    state.lastStatus == "Charging" || state.lastStatus == "Charging (topping off)" || state.lastStatus == "Full"
                 state.chargingSinceMs = 0L
                 state.fullReadingStreak = 0
+                if (wasOperational) {
+                    Log.w("Ds3Charger", "deviceId=${state.deviceId} dropped out of operational mode while USB-tracked (raw=0x%02x) - re-arming".format(raw))
+                    state.connection.claimInterface(state.intf, true)
+                    val reArmed = try {
+                        sendOperationalKickAndVerify(state.connection, state.intf)
+                    } finally {
+                        state.connection.releaseInterface(state.intf)
+                    }
+                    Log.i("Ds3Charger", "deviceId=${state.deviceId} re-arm ${if (reArmed) "succeeded" else "failed"}")
+                }
                 SIXAXIS_BATTERY_CAPACITY[minOf(raw, 5)] to "On battery (not charging)"
             }
         }
