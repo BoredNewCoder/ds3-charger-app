@@ -259,6 +259,22 @@ class Ds3ChargerService : Service() {
     // original, long-tested value is the safer default until/unless real evidence says otherwise.
     private val FAST_POLL_INTERVAL_MS = 30_000L
 
+    // Live-measured 2026-09-11 via adb: this device's upstream USB hub has
+    // /sys/.../power/autosuspend_delay_ms = 2000 - if nothing touches the bus for
+    // 2s the hub can idle-suspend, which per USB topology rules forces every child
+    // on it (the DS3 included) into suspend too regardless of the DS3's own
+    // power/control setting. FAST_POLL_INTERVAL_MS's 30s gap is 15x longer than
+    // that, so the hub is very likely suspending between polls. A prior 1s-poll
+    // attempt (see FAST_POLL_INTERVAL_MS's revert comment) tried fixing this by
+    // polling faster but used pollBattery's own claimInterface(force)/release
+    // cycle every time, which fights the OS's own HID driver for the interface
+    // 30x more often - real regression, not a real fix. This keep-alive is
+    // different: bare GET_STATUS to endpoint 0 (device recipient, not the HID
+    // interface) needs no claimInterface at all, so it can't contend with
+    // anything else using the interface. Kept well under 2000ms for margin.
+    // UNPROVEN - first real attempt at this specific mechanism, 2026-09-11.
+    private val KEEP_ALIVE_INTERVAL_MS = 1500L
+
     // "Fully charged" gate. The DS3's charge controller (and clone boards
     // especially - this app targets a Shanwan clone) flips byte 30's low bit
     // to "done" (0xEF) noticeably before the pack is actually topped off: a
@@ -405,6 +421,30 @@ class Ds3ChargerService : Service() {
         }
     }
 
+    // See KEEP_ALIVE_INTERVAL_MS's doc comment for why this exists and why it's
+    // deliberately NOT routed through claimInterface/pollBattery.
+    private val keepAliveRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val snapshot = synchronized(devices) { devices.values.toList() }
+                for (state in snapshot) {
+                    try {
+                        val buf = ByteArray(2)
+                        // Standard GET_STATUS, device recipient (bmRequestType 0x80,
+                        // bRequest 0x00) - every USB device must answer this, targets
+                        // endpoint 0 only, no interface claim needed.
+                        state.connection.controlTransfer(0x80, 0x00, 0, 0, buf, buf.size, 500)
+                    } catch (e: Throwable) {
+                        // Non-fatal by design - this is a best-effort keep-alive, not a
+                        // functional operation anything else depends on.
+                    }
+                }
+            } finally {
+                bgHandler.postDelayed(this, KEEP_ALIVE_INTERVAL_MS)
+            }
+        }
+    }
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -469,6 +509,7 @@ class Ds3ChargerService : Service() {
             .forEach { checkAndRequestDevice(it) }
 
         bgHandler.post(pollRunnable)
+        bgHandler.postDelayed(keepAliveRunnable, KEEP_ALIVE_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
