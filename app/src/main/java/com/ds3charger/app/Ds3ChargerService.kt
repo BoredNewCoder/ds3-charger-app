@@ -165,6 +165,12 @@ class Ds3ChargerService : Service() {
         var intf: UsbInterface,
         var infoLine: String,
         var deviceId: Int,
+        // Kept so a stalled-precharge full reconnect (see attemptFullPrechargeRetry below) can
+        // re-resolve + re-open the physical device later, the same way retryChargeCommand does
+        // for an initial connect failure - a captured UsbDevice's internal path reference can go
+        // stale if the kernel re-enumerates the bus path in between, so always re-resolve by
+        // deviceId/VID/PID at retry time rather than trusting this field directly for openDevice().
+        var device: UsbDevice,
         var lastBatteryPct: Int = -1,
         var lastStatus: String = "",
         var consecutivePollFailures: Int = 0,
@@ -175,6 +181,15 @@ class Ds3ChargerService : Service() {
         // Consecutive polls byte 30 has reported "full" (0xEF). Debounces a
         // transient/early full reading before it's relayed as 100% / "Full".
         var fullReadingStreak: Int = 0,
+        // elapsedRealtime() of the last attemptFullPrechargeRetry() call - throttles retries
+        // (see FULL_PRECHARGE_RETRY_INTERVAL_MS) so this doesn't hammer a genuinely-full or
+        // genuinely-fine controller every single poll.
+        var lastFullReconnectAttemptMs: Long = 0L,
+        // Bounded so a controller that's genuinely already full on connect (chargingSinceMs
+        // legitimately stays 0 forever in that case too - see the "done" branch's own comment)
+        // doesn't get reconnect-spammed forever. Reset to 0 the moment a real 0xEE ("actively
+        // charging") reading is ever seen - see MAX_PRECHARGE_RETRIES's doc comment.
+        var prechargeRetryCount: Int = 0,
         var authCheckResult: AuthCheckResult? = null,
     )
 
@@ -257,6 +272,37 @@ class Ds3ChargerService : Service() {
     // chargingSinceMs stays 0) skips the time gate but still needs the streak.
     private val FULL_CONFIRM_POLLS = 3
     private val MIN_CHARGE_BEFORE_FULL_MS = 25 * 60 * 1000L
+
+    // Real, sourced finding (2026-09-11 live investigation): the DS3 uses a TI bqTINY-II charge
+    // management IC. Per its documented behavior, a too-deeply-discharged cell gets a
+    // precharge/trickle current under an internal safety timer; if the cell's voltage doesn't
+    // cross a threshold within that window, the IC stops and asserts FAULT on its status pins -
+    // needing a fresh power cycle to retry. Live-confirmed this matches what's actually happening
+    // here: two consecutive polls 30s apart both read the SAME "done" byte (0xf1) spanning the
+    // exact window an external ammeter showed real trickle current (0.03-0.20A) drop to 0 - the
+    // byte never moves, so it can't be a live completion signal; it's almost certainly reporting
+    // that FAULT state, not a genuine 100% charge, especially given it reads "done" within
+    // seconds of every fresh connect (nowhere near enough time to actually finish charging a
+    // dead cell). Also live-confirmed: every FRESH physical USB attach tonight produced a new
+    // burst of real current - consistent with a fresh attach clearing the prior FAULT and
+    // starting a new precharge attempt. No live signal exists to know exactly when the FAULT
+    // fires (byte 30 doesn't change), so this can't be event-triggered - instead,
+    // attemptFullPrechargeRetry() below periodically forces a full close+reopen+re-handshake
+    // (the software equivalent of a real unplug/replug) while a device has been stuck reporting
+    // "done" since before it ever showed a genuine chargingSinceMs (i.e. never confirmed actively
+    // charging in the first place) - giving a deeply-discharged cell repeated fresh precharge
+    // attempts instead of the one attempt a passive connection gets.
+    private val FULL_PRECHARGE_RETRY_INTERVAL_MS = 15_000L
+
+    // Caps attemptFullPrechargeRetry() at 20 attempts (20 * 15s = ~5 minutes of real retrying)
+    // before giving up and letting the normal "done" logic just report Full/topping-off as
+    // usual - without this, a controller that's genuinely already full the moment it's plugged
+    // in (chargingSinceMs legitimately stays 0 in that case too, same as the stuck-FAULT case -
+    // the two are indistinguishable from byte 30 alone) would get reconnect-spammed forever.
+    // 5 minutes is generous enough to actually nurse a deeply-discharged cell past the bqTINY-II's
+    // precharge threshold if repeated fresh attempts can do that at all, without churning
+    // uselessly on a healthy controller past a reasonable point.
+    private val MAX_PRECHARGE_RETRIES = 20
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var listener: Listener? = null
@@ -582,7 +628,7 @@ class Ds3ChargerService : Service() {
         } catch (e: Exception) { "Sony PLAYSTATION(R)3 Controller" }
         val infoLine = "Device: $name\nVID=0x${device.vendorId.toString(16)} " +
             "PID=0x${device.productId.toString(16)}  Interfaces=${device.interfaceCount}"
-        val state = DeviceState(connection, intf, infoLine, device.deviceId)
+        val state = DeviceState(connection, intf, infoLine, device.deviceId, device)
         // Charging couldn't be confirmed after every attempt - say so honestly instead of letting the
         // first pollBattery paint a normal-looking status over a controller that isn't charging.
         if (!chargingConfirmed) state.lastStatus = "USB connected - charging not confirmed"
@@ -668,6 +714,61 @@ class Ds3ChargerService : Service() {
             ?: current.firstOrNull { it.vendorId == vendorId && it.productId == productId }
     }
 
+    // Forces a REAL full reconnect - close the connection, re-resolve the live UsbDevice (its
+    // bus path can change across a close, same reasoning as retryChargeCommand), re-open, re-run
+    // the FULL operational handshake from scratch (step 1's 0xF2 GET_REPORT +
+    // sendOperationalKickAndVerify's steps 2+3+verify) - not just the lightweight claim/read/
+    // release pollBattery does every tick. See FULL_PRECHARGE_RETRY_INTERVAL_MS's doc comment
+    // for why: this is the software equivalent of a real unplug/replug, which is the one thing
+    // that's repeatedly, empirically correlated with a fresh burst of real charging current
+    // tonight - the DS3's own charge IC (bqTINY-II) needs a real power-cycle to clear a prior
+    // precharge-safety-timeout FAULT and start a new attempt. On success, swaps the live
+    // connection/interface into `state` so every caller (including the NEXT poll) uses the
+    // fresh one; the old connection is always closed either way, never leaked.
+    private fun attemptFullPrechargeRetry(state: DeviceState): Boolean {
+        Log.i("Ds3Charger", "deviceId=${state.deviceId} attempting full precharge retry (close+reopen+re-handshake)")
+        val oldConnection = state.connection
+        try { oldConnection.close() } catch (e: Exception) { /* already dead, fine */ }
+
+        val fresh = resolveCurrentDevice(state.deviceId, state.device.vendorId, state.device.productId)
+        if (fresh == null) {
+            Log.w("Ds3Charger", "deviceId=${state.deviceId} precharge retry: device no longer present")
+            return false
+        }
+        val newConnection = usbManager.openDevice(fresh)
+        if (newConnection == null) {
+            Log.w("Ds3Charger", "deviceId=${state.deviceId} precharge retry: openDevice failed")
+            return false
+        }
+        val newIntf = fresh.getInterface(0)
+        if (!newConnection.claimInterface(newIntf, false) && !newConnection.claimInterface(newIntf, true)) {
+            newConnection.close()
+            Log.w("Ds3Charger", "deviceId=${state.deviceId} precharge retry: claimInterface failed")
+            return false
+        }
+        // Step 1 of sixaxis_set_operational_usb() - same 0xF2 GET_REPORT sendChargeCommandAttempt
+        // uses on a genuinely fresh connect.
+        val buf1 = ByteArray(17)
+        val step1Result = newConnection.controlTransfer(0xA1, 0x01, 0x03F2, newIntf.id, buf1, buf1.size, 5000)
+        if (step1Result < 0) {
+            newConnection.releaseInterface(newIntf)
+            newConnection.close()
+            Log.w("Ds3Charger", "deviceId=${state.deviceId} precharge retry: step 1 (0xF2) failed, result=$step1Result")
+            return false
+        }
+        val reconnected = sendOperationalKickAndVerify(newConnection, newIntf)
+        newConnection.releaseInterface(newIntf)
+
+        // Adopt the new connection/device regardless of whether reconnected==true (a fresh
+        // connection is still strictly better than the closed one it's replacing) - only bail
+        // out to a fully-dead state if openDevice/claimInterface/step1 above already returned.
+        state.connection = newConnection
+        state.intf = newIntf
+        state.device = fresh
+        Log.i("Ds3Charger", "deviceId=${state.deviceId} precharge retry ${if (reconnected) "confirmed operational" else "reconnected but not yet confirmed operational"}")
+        return reconnected
+    }
+
     private fun pollBattery(state: DeviceState) {
         // Claim -> read -> release EVERY poll (not held continuously) - see
         // sendChargeCommand()'s note above, same reasoning applies here.
@@ -706,16 +807,37 @@ class Ds3ChargerService : Service() {
         val (pct, status) = when {
             raw >= 0xee -> {
                 if (raw and 0x01 != 1) {
-                    // Low bit clear (0xEE) = still charging. No live % on the wire.
+                    // Low bit clear (0xEE) = still charging. No live % on the wire. A real
+                    // active-charging confirmation - the precharge-FAULT retry loop below is
+                    // done, this device is genuinely charging normally now.
                     if (state.chargingSinceMs == 0L) state.chargingSinceMs = SystemClock.elapsedRealtime()
                     state.fullReadingStreak = 0
+                    state.prechargeRetryCount = 0
                     -1 to "Charging"
                 } else {
-                    // Low bit set (0xEF) = "done charging". Don't relay that as
-                    // Full until it has held for FULL_CONFIRM_POLLS in a row AND
-                    // the controller has been charging at least
-                    // MIN_CHARGE_BEFORE_FULL_MS - see those constants for why an
-                    // early 0xEF on this hardware lies.
+                    // Low bit set (0xEF/0xF1) = "done charging" per the naive kernel-driver
+                    // interpretation - but see FULL_PRECHARGE_RETRY_INTERVAL_MS's doc comment:
+                    // live-confirmed this reads far too early to be a genuine full charge on a
+                    // deeply-discharged cell, and is very likely actually the bqTINY-II charge
+                    // IC's FAULT/safety-timeout state. When this shows up before ever having
+                    // seen a real 0xEE first (chargingSinceMs still 0), periodically force a
+                    // full reconnect to give the cell another real precharge attempt - bounded
+                    // by MAX_PRECHARGE_RETRIES so a controller that's genuinely already full on
+                    // connect (indistinguishable from the stuck case by this byte alone) doesn't
+                    // get reconnect-spammed forever.
+                    if (state.chargingSinceMs == 0L && state.prechargeRetryCount < MAX_PRECHARGE_RETRIES) {
+                        val nowMs = SystemClock.elapsedRealtime()
+                        if (nowMs - state.lastFullReconnectAttemptMs >= FULL_PRECHARGE_RETRY_INTERVAL_MS) {
+                            state.lastFullReconnectAttemptMs = nowMs
+                            state.prechargeRetryCount++
+                            Log.w("Ds3Charger", "deviceId=${state.deviceId} stuck reporting 'done' (raw=0x%02x) without ever confirming real charging - precharge retry ${state.prechargeRetryCount}/$MAX_PRECHARGE_RETRIES".format(raw))
+                            attemptFullPrechargeRetry(state)
+                        }
+                    }
+                    // Don't relay a bare 0xEF/0xF1 as Full until it has held for
+                    // FULL_CONFIRM_POLLS in a row AND the controller has been charging at least
+                    // MIN_CHARGE_BEFORE_FULL_MS - see those constants for why an early 0xEF on
+                    // this hardware lies.
                     state.fullReadingStreak++
                     val chargedLongEnough = state.chargingSinceMs == 0L ||
                         SystemClock.elapsedRealtime() - state.chargingSinceMs >= MIN_CHARGE_BEFORE_FULL_MS
