@@ -21,8 +21,8 @@ android {
         applicationId = "com.ds3charger.app"
         minSdk = 21
         targetSdk = 34
-        versionCode = 13
-        versionName = "1.4.16"
+        versionCode = 14
+        versionName = "1.4.17"
     }
 
     signingConfigs {

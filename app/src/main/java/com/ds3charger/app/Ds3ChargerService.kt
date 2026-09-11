@@ -870,20 +870,27 @@ class Ds3ChargerService : Service() {
                     // MIN_CHARGE_BEFORE_FULL_MS - see those constants for why an early 0xEF on
                     // this hardware lies.
                     state.fullReadingStreak++
-                    val chargedLongEnough = state.chargingSinceMs == 0L ||
+                    // Two different questions, deliberately kept separate after a real bug found
+                    // 2026-09-11: display text can reasonably call it Full quickly when we've never
+                    // seen a real charge start (a controller that's already full on connect
+                    // shouldn't wait a fake 25min) - but the RETRY loop must NOT use that same
+                    // bypass, or a device stuck at 0xf1 with chargingSinceMs still 0 flips to
+                    // "confirmed Full" after just FULL_CONFIRM_POLLS (3) polls and permanently
+                    // stops retrying, exactly the case this retry exists to fix. Live-confirmed:
+                    // deviceId=1008 retried twice then went silent for 5+ minutes straight, still
+                    // stuck at 0xf1 the whole time, because of this exact bypass. Retrying should
+                    // only stop for a REAL reason: budget exhausted (MAX_PRECHARGE_RETRIES), or a
+                    // genuine charge really did run long enough (chargingSinceMs != 0L, no bypass).
+                    val chargedLongEnoughForDisplay = state.chargingSinceMs == 0L ||
                         SystemClock.elapsedRealtime() - state.chargingSinceMs >= MIN_CHARGE_BEFORE_FULL_MS
-                    val confirmedFull = state.fullReadingStreak >= FULL_CONFIRM_POLLS && chargedLongEnough
+                    val confirmedFull = state.fullReadingStreak >= FULL_CONFIRM_POLLS && chargedLongEnoughForDisplay
+                    val genuinelyConfirmedFull = state.chargingSinceMs != 0L &&
+                        SystemClock.elapsedRealtime() - state.chargingSinceMs >= MIN_CHARGE_BEFORE_FULL_MS &&
+                        state.fullReadingStreak >= FULL_CONFIRM_POLLS
 
-                    // Live-confirmed 2026-09-11: one real 0xEE reading (setting chargingSinceMs)
-                    // used to permanently disable this retry, on the theory that a real charge
-                    // had started and would finish on its own. Real log showed that's false - the
-                    // reading can revert to stuck 0xF1 seconds later, and neither this retry nor
-                    // the re-arm branch below could fire again (re-arm needs raw<0xEE, which
-                    // never happened - it went straight from 0xEE back to 0xF1). So retry any
-                    // time we're NOT yet confirmed Full, not just before the first 0xEE - bounded
-                    // by MAX_PRECHARGE_RETRIES so a controller that's genuinely full doesn't get
-                    // reconnect-spammed forever once confirmedFull is true.
-                    if (!confirmedFull && state.prechargeRetryCount < MAX_PRECHARGE_RETRIES) {
+                    // See doc comment above - retry keeps going (bounded by MAX_PRECHARGE_RETRIES)
+                    // until a REAL charge is confirmed, not just until the display says Full.
+                    if (!genuinelyConfirmedFull && state.prechargeRetryCount < MAX_PRECHARGE_RETRIES) {
                         val nowMs = SystemClock.elapsedRealtime()
                         if (nowMs - state.lastFullReconnectAttemptMs >= FULL_PRECHARGE_RETRY_INTERVAL_MS) {
                             state.lastFullReconnectAttemptMs = nowMs
