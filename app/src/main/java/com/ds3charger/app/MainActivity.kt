@@ -70,7 +70,16 @@ class MainActivity : Activity(), Ds3ChargerService.Listener {
 
         requestNotificationPermissionIfNeeded()
 
-        bindService(Intent(this, Ds3ChargerService::class.java), connection, Context.BIND_AUTO_CREATE)
+        // Start the service (not just bind) so it outlives this screen. A bound-only service is
+        // destroyed when onStop unbinds, which closed the DS3 connection and stopped charging
+        // monitoring the moment the app was left.
+        val svcIntent = Intent(this, Ds3ChargerService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(svcIntent)
+        } else {
+            startService(svcIntent)
+        }
+        bindService(svcIntent, connection, Context.BIND_AUTO_CREATE)
         bound = true
     }
 
