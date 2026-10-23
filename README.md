@@ -223,6 +223,44 @@ charging) skips the time gate but still needs the three-poll streak. The charge-
 still fires once, on the real transition into Full. Each poll now also logs the raw byte-30
 value (`adb logcat -s Ds3Charger`) so a future mismatch can be diagnosed from real data.
 
+## Repeat permission dialog on every replug (v1.4.9)
+
+`MainActivity` is `singleTask` and had no `onNewIntent()`, so only the *first* USB attach after a
+fresh launch took the silent auto-granted path. Every later replug fell through to the system
+USB-permission dialog (and popped the UI to the foreground). Both entry points now share one
+attach handler: forward to the service, `finish()` immediately, no dialog, no UI flash.
+
+## Charge dropping out, stalled precharge, and the hub keep-alive (v1.4.10 – v1.4.17)
+
+A series of fixes from live ammeter testing with a deeply discharged controller:
+
+- **v1.4.10 / v1.4.11:** polling the battery every 1 s while charging was tried and reverted. The
+  force-claim/release cycle on each poll contended with the OS's own HID driver and made the charge
+  current drop sooner, not later.
+- **v1.4.12:** NVIDIA's own `com.nvidia.bluetooth.ps3usbpairer` also listens for the same USB-attach
+  broadcast and claims the same interface, which can knock an already-connected DS3 out of
+  operational mode. If the controller is still USB-attached but reads as not charging, the app now
+  re-arms operational mode (steps 2 and 3 plus a verify read).
+- **v1.4.13:** the shared poll loop could sit idle for up to 15 minutes after a fresh connect, so the
+  re-arm never ran. A newly connected device is now polled immediately and watched closely from the
+  first second.
+- **v1.4.14 – v1.4.17:** a too-deeply-discharged cell gets a trickle precharge under the charge IC's
+  safety timer. If the cell's voltage doesn't recover in time, the IC stops and a fresh power cycle is
+  needed, while the status byte still reads "done". The app now retries with a full reconnect
+  (bounded by a retry budget) instead of trusting that byte, keeps retrying until a real charge is
+  confirmed, and no longer gives up after three polls.
+- **v1.4.16:** a bare `GET_STATUS` request to endpoint 0 every 1.5 s keeps a USB hub from
+  idle-suspending between polls during a charge. This needs no interface claim, so it can't contend with
+  anything else using the controller. This one is unproven on real hardware.
+
+## Charging keeps running in the background (v1.4.18)
+
+Opening the app from the launcher only *bound* to the charger service, so leaving the screen
+unbound it and Android destroyed the service. That closed the controller's USB connection and
+stopped charge monitoring until the next plug-in or reboot. `MainActivity` now starts the service
+as a foreground service as well as binding to it, so charging detection and monitoring continue
+after you leave the app. Plug-in and boot still start it automatically.
+
 ## Requirements
 
 - An Android device with USB host support (tested on NVIDIA Shield TV Pro)
@@ -237,6 +275,11 @@ Grab the APK from [Releases](../../releases) and sideload it:
 adb connect <device-ip>
 adb install app-debug.apk
 ```
+
+Release APKs are debug-signed. If an older install was signed with a different debug key,
+`adb install -r` fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Run
+`adb uninstall com.ds3charger.app` first, then replug the controller and accept the USB
+permission prompt once.
 
 ## Build from source
 
